@@ -101,7 +101,7 @@ export function NewTaskModal({
 
   const { getWorkspacesByOrganization, getCurrentOrganizationId, getWorkspaceBySlug } =
     useWorkspace();
-  const { getProjectsByWorkspace, getTaskStatusByProject } = useProject();
+  const { getProjectsByWorkspace, getTaskStatusByProject, getProjectMembers } = useProject();
   const { createTask, createSubtask } = useTask();
   const { fetchAnalyticsData } = useProject();
   const { getSprintsByProject, getActiveSprint } = useSprint();
