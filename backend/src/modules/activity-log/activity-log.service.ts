@@ -1,10 +1,11 @@
 // src/activity-log/activity-log.service.ts
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { ActivityLog, ActivityType, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 
 @Injectable()
 export class ActivityLogService {
+  private readonly logger = new Logger(ActivityLogService.name);
   constructor(private prisma: PrismaService) {}
 
   async logActivity(data: {
@@ -17,12 +18,46 @@ export class ActivityLogService {
     oldValue?: any;
     newValue?: any;
   }) {
+    let resolvedEntityId = data.entityId;
+
+    // Resolve taskId if it's a slug and entityType is Task
+    if (data.entityType.toLowerCase() === 'task') {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        data.entityId,
+      );
+
+      if (!isUuid) {
+        const task = await this.prisma.task.findFirst({
+          where: { slug: data.entityId },
+          select: { id: true },
+        });
+        if (task) {
+          resolvedEntityId = task.id;
+        } else {
+          this.logger.warn(
+            `Could not resolve task slug to UUID for activity log: ${data.entityId}`,
+          );
+        }
+      }
+    }
+
+    const finalIsUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      resolvedEntityId,
+    );
+
+    if (!finalIsUuid && resolvedEntityId) {
+      this.logger.error(
+        `Attempting to log activity with non-UUID entityId: ${resolvedEntityId} (EntityType: ${data.entityType})`,
+      );
+      return; // Prevent Prisma crash
+    }
+
     return await this.prisma.activityLog.create({
       data: {
         type: data.type,
         description: data.description,
         entityType: data.entityType,
-        entityId: data.entityId,
+        entityId: resolvedEntityId,
         userId: data.userId,
         organizationId: data.organizationId,
         oldValue: data.oldValue || null,
@@ -83,12 +118,16 @@ export class ActivityLogService {
     });
   }
 
-  async getTaskParticipants(taskId: string): Promise<string[]> {
-    if (!taskId) return [];
+  async getTaskParticipants(taskIdOrSlug: string): Promise<string[]> {
+    if (!taskIdOrSlug) return [];
 
     try {
-      const task = await this.prisma.task.findUnique({
-        where: { id: taskId },
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        taskIdOrSlug,
+      );
+
+      const task = await this.prisma.task.findFirst({
+        where: isUuid ? { id: taskIdOrSlug } : { slug: taskIdOrSlug },
         select: {
           assignees: true,
           reporters: true,
@@ -156,8 +195,11 @@ export class ActivityLogService {
     try {
       switch (entityType.toLowerCase()) {
         case 'task': {
-          const task = await this.prisma.task.findUnique({
-            where: { id: entityId },
+          const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+            entityId,
+          );
+          const task = await this.prisma.task.findFirst({
+            where: isUuid ? { id: entityId } : { slug: entityId },
             select: {
               project: {
                 select: {
@@ -226,7 +268,7 @@ export class ActivityLogService {
   }
 
   async getTaskActivities(
-    taskId: string,
+    taskIdOrSlug: string,
     page: number = 1,
     limit: number = 50,
   ): Promise<{
@@ -239,14 +281,21 @@ export class ActivityLogService {
       hasPrevPage: boolean;
     };
   }> {
-    // Validate task exists
-    const taskExists = await this.prisma.task.findFirst({
-      where: { id: taskId },
+    // Resolve taskId if it's a slug
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      taskIdOrSlug,
+    );
+
+    const task = await this.prisma.task.findFirst({
+      where: isUuid ? { id: taskIdOrSlug } : { slug: taskIdOrSlug },
+      select: { id: true },
     });
 
-    if (!taskExists) {
-      throw new Error('Task not found');
+    if (!task) {
+      throw new NotFoundException('Task not found');
     }
+
+    const taskId = task.id;
 
     // Simple where clause - just match entityId with taskId
     const whereClause = {
@@ -377,9 +426,9 @@ export class ActivityLogService {
       u.last_name,
       u.email,
       u.avatar,
-      t.slug as task_slug,
-      tp.slug as task_project_slug,
-      tw.slug as task_workspace_slug,
+      COALESCE(t.slug, ct.slug) as task_slug,
+      COALESCE(tp.slug, ctp.slug) as task_project_slug,
+      COALESCE(tw.slug, ctw.slug) as task_workspace_slug,
       pp.slug as project_slug,
       pw.slug as project_workspace_slug,
       ws.slug as workspace_slug,
@@ -388,9 +437,16 @@ export class ActivityLogService {
       spw.slug as sprint_workspace_slug
     FROM activity_logs al
     JOIN users u ON al.user_id = u.id
-    LEFT JOIN tasks t ON al.entity_type = 'Task' AND al.entity_id = t.id
+    -- Standard Task join for types where entity_id is taskId
+    LEFT JOIN tasks t ON (al.entity_type IN ('Task', 'Task Label', 'TaskAttachment', 'Task Attchment')) AND al.entity_id = t.id
     LEFT JOIN projects tp ON t.project_id = tp.id
     LEFT JOIN workspaces tw ON tp.workspace_id = tw.id
+    -- Join for Task Comment where entity_id is commentId
+    LEFT JOIN task_comments tc ON (al.entity_type IN ('Task Comment', 'TaskComment')) AND al.entity_id = tc.id
+    LEFT JOIN tasks ct ON tc.task_id = ct.id
+    LEFT JOIN projects ctp ON ct.project_id = ctp.id
+    LEFT JOIN workspaces ctw ON ctp.workspace_id = ctw.id
+    -- Standard Project/Workspace/Sprint joins
     LEFT JOIN projects pp ON al.entity_type = 'Project' AND al.entity_id = pp.id
     LEFT JOIN workspaces pw ON pp.workspace_id = pw.id
     LEFT JOIN workspaces ws ON al.entity_type = 'Workspace' AND al.entity_id = ws.id
@@ -404,8 +460,15 @@ export class ActivityLogService {
         SELECT id FROM projects WHERE workspace_id = ${workspaceId}::uuid
       ))
       OR
-      (al.entity_type = 'Task' AND al.entity_id IN (
+      (al.entity_type IN ('Task', 'Task Label', 'TaskAttachment', 'Task Attchment') AND al.entity_id IN (
         SELECT t.id FROM tasks t
+        JOIN projects p ON t.project_id = p.id
+        WHERE p.workspace_id = ${workspaceId}::uuid
+      ))
+      OR
+      (al.entity_type IN ('Task Comment', 'TaskComment') AND al.entity_id IN (
+        SELECT tc.id FROM task_comments tc
+        JOIN tasks t ON tc.task_id = t.id
         JOIN projects p ON t.project_id = p.id
         WHERE p.workspace_id = ${workspaceId}::uuid
       ))
@@ -749,9 +812,9 @@ export class ActivityLogService {
         u.last_name,
         u.email,
         u.avatar,
-        t.slug as task_slug,
-        tp.slug as task_project_slug,
-        tw.slug as task_workspace_slug,
+        COALESCE(t.slug, ct.slug) as task_slug,
+        COALESCE(tp.slug, ctp.slug) as task_project_slug,
+        COALESCE(tw.slug, ctw.slug) as task_workspace_slug,
         pp.slug as project_slug,
         pw.slug as project_workspace_slug,
         ws.slug as workspace_slug,
@@ -760,9 +823,16 @@ export class ActivityLogService {
         spw.slug as sprint_workspace_slug
       FROM activity_logs al
       JOIN users u ON al.user_id = u.id
-      LEFT JOIN tasks t ON al.entity_type = 'Task' AND al.entity_id = t.id
+      -- Standard Task join for types where entity_id is taskId
+      LEFT JOIN tasks t ON (al.entity_type IN ('Task', 'Task Label', 'TaskAttachment', 'Task Attchment')) AND al.entity_id = t.id
       LEFT JOIN projects tp ON t.project_id = tp.id
       LEFT JOIN workspaces tw ON tp.workspace_id = tw.id
+      -- Join for Task Comment where entity_id is commentId
+      LEFT JOIN task_comments tc ON (al.entity_type IN ('Task Comment', 'TaskComment')) AND al.entity_id = tc.id
+      LEFT JOIN tasks ct ON tc.task_id = ct.id
+      LEFT JOIN projects ctp ON ct.project_id = ctp.id
+      LEFT JOIN workspaces ctw ON ctp.workspace_id = ctw.id
+      -- Standard Project/Workspace/Sprint joins
       LEFT JOIN projects pp ON al.entity_type = 'Project' AND al.entity_id = pp.id
       LEFT JOIN workspaces pw ON pp.workspace_id = pw.id
       LEFT JOIN workspaces ws ON al.entity_type = 'Workspace' AND al.entity_id = ws.id
@@ -779,8 +849,15 @@ export class ActivityLogService {
           JOIN workspaces w ON p.workspace_id = w.id
           WHERE w.organization_id = ${organizationId}::uuid
         ))
-        OR (al.entity_type = 'Task' AND al.entity_id IN (
+        OR (al.entity_type IN ('Task', 'Task Label', 'TaskAttachment', 'Task Attchment') AND al.entity_id IN (
           SELECT t.id FROM tasks t
+          JOIN projects p ON t.project_id = p.id
+          JOIN workspaces w ON p.workspace_id = w.id
+          WHERE w.organization_id = ${organizationId}::uuid
+        ))
+        OR (al.entity_type IN ('Task Comment', 'TaskComment') AND al.entity_id IN (
+          SELECT tc.id FROM task_comments tc
+          JOIN tasks t ON tc.task_id = t.id
           JOIN projects p ON t.project_id = p.id
           JOIN workspaces w ON p.workspace_id = w.id
           WHERE w.organization_id = ${organizationId}::uuid

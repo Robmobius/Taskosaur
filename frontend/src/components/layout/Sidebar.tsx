@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { useEffect, useState, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { getSidebarCollapsedState, toggleSidebar as toggleSidebarUtil } from "@/utils/sidebarUtils";
 import { Plus } from "lucide-react";
 import { useAuth } from "@/contexts/auth-context";
@@ -8,6 +9,7 @@ import ResizableSidebar from "./ResizableSidebar";
 import WorkspaceSelector from "./WorkspaceSelector";
 import ProjectSelector from "./ProjectSelector";
 import WorkspaceTree from "./WorkspaceTree";
+import Tooltip from "@/components/common/ToolTip";
 
 import {
   HiHome,
@@ -81,6 +83,7 @@ const usePathnameParsing = (pathname: string, isMounted: boolean) => {
 };
 
 export default function Sidebar() {
+  const { t } = useTranslation("sidebar");
   const router = useRouter();
   const pathname = router.asPath.split("?")[0];
   const { isAuthenticated, getCurrentUser } = useAuth();
@@ -141,48 +144,48 @@ export default function Sidebar() {
   const globalNavItems = useMemo(
     () => [
       {
-        name: "Dashboard",
+        name: t("dashboard"),
         href: "/dashboard",
         icon: <HiHome size={16} />,
-        title: "Global Dashboard",
+        title: t("globalDashboard"),
         disabled: !isAuth,
       },
       {
-        name: "Workspaces",
+        name: t("workspaces"),
         href: "/workspaces",
         icon: <HiViewGrid size={16} />,
-        title: "All Workspaces",
+        title: t("allWorkspaces"),
         disabled: !isAuth,
       },
       {
-        name: "Projects",
+        name: t("projects"),
         href: "/projects",
         icon: <HiViewBoards size={16} />,
-        title: "All Projects",
+        title: t("allProjects"),
         disabled: !isAuth,
       },
       {
-        name: "Tasks",
+        name: t("tasks"),
         href: "/tasks",
         icon: <HiClipboardList size={16} />,
-        title: "All Tasks",
+        title: t("allTasks"),
         disabled: !isAuth,
       },
       {
-        name: "Activities",
+        name: t("activities"),
         href: "/activities",
         icon: <HiCalendar size={16} />,
-        title: "All Activities",
+        title: t("allActivities"),
         disabled: !isAuth,
       },
       // Settings only shown to authenticated users
       ...(isAuth
         ? [
             {
-              name: "Settings",
+              name: t("settings"),
               href: "/settings",
               icon: <HiCog size={16} />,
-              title: "All Settings",
+              title: t("allSettings"),
               disabled: false,
             },
           ]
@@ -191,10 +194,10 @@ export default function Sidebar() {
       ...(isAuth && currentUser?.role === "SUPER_ADMIN"
         ? [
             {
-              name: "Admin",
+              name: t("admin"),
               href: "/admin",
               icon: <HiShieldCheck size={16} />,
-              title: "System Administration",
+              title: t("systemAdministration"),
               disabled: false,
             },
             {
@@ -208,7 +211,7 @@ export default function Sidebar() {
           ]
         : []),
     ],
-    [isAuth, currentUser?.role]
+    [isAuth, currentUser?.role, t]
   );
 
   const workspaceNavItems = useMemo(
@@ -216,83 +219,79 @@ export default function Sidebar() {
       currentWorkspaceSlug
         ? [
             {
-              name: "Overview",
+              name: t("overview"),
               href: `/${currentWorkspaceSlug}`,
               icon: <HiViewGrid size={16} />,
-              title: "Workspace Overview",
+              title: t("workspaceOverview"),
               disabled: !isAuth,
             },
             {
-              name: "Projects",
+              name: t("projects"),
               href: `/${currentWorkspaceSlug}/projects`,
               icon: <HiViewBoards size={16} />,
-              title: "Workspace Projects",
+              title: t("workspaceProjects"),
               disabled: !isAuth,
             },
-            ...(!isViewer
-              ? [
-                  {
-                    name: "Members",
-                    href: `/${currentWorkspaceSlug}/members`,
-                    icon: <HiUsers size={16} />,
-                    title: "Workspace Members",
-                    disabled: !isAuth,
-                  },
-                ]
-              : []),
             {
-              name: "Activities",
+              name: t("members"),
+              href: `/${currentWorkspaceSlug}/members`,
+              icon: <HiUsers size={16} />,
+              title: t("workspaceMembers"),
+              disabled: !isAuth,
+            },
+            {
+              name: t("activities"),
               href: `/${currentWorkspaceSlug}/activities`,
               icon: <HiCalendar size={16} />,
-              title: "Workspace Activity",
+              title: t("workspaceActivity"),
               disabled: !isAuth,
             },
             {
-              name: "Tasks",
+              name: t("tasks"),
               href: `/${currentWorkspaceSlug}/tasks`,
               icon: <HiClipboardList size={16} />,
-              title: "Workspace Tasks",
+              title: t("workspaceTasks"),
               disabled: !isAuth,
             },
             // Settings only shown to authenticated non-viewer users
             ...(isAuth && !isViewer
               ? [
                   {
-                    name: "Settings",
+                    name: t("settings"),
                     href: `/${currentWorkspaceSlug}/settings`,
                     icon: <HiCog size={16} />,
-                    title: "Workspace Settings",
+                    title: t("workspaceSettings"),
                     disabled: false,
                   },
                 ]
               : []),
           ]
         : [],
-    [currentWorkspaceSlug, isAuth, isViewer]
+    [currentWorkspaceSlug, isAuth, t]
   );
 
   // Default project navigation items for unauthenticated users (all disabled)
   const defaultProjectNavItems = useMemo(
     () => [
       {
-        name: "Overview",
+        name: t("overview"),
         href: `/${currentWorkspaceSlug || ""}/${currentProjectSlug || ""}`,
         icon: <HiViewBoards size={16} />,
-        title: "Project Overview",
+        title: t("projectOverview"),
         disabled: false, // usually for unauthenticated users
       },
       {
-        name: "Tasks",
+        name: t("tasks"),
         href: `/${currentWorkspaceSlug || ""}/${currentProjectSlug || ""}/tasks`,
         icon: <HiClipboardList size={16} />,
-        title: "Tasks",
+        title: t("tasks"),
         disabled: false,
       },
       {
-        name: "Sprints",
+        name: t("sprints"),
         href: `/${currentWorkspaceSlug || ""}/${currentProjectSlug || ""}/sprints`,
         icon: <HiLightningBolt size={16} />,
-        title: "Sprints",
+        title: t("sprints"),
         disabled: false,
       },
       // {
@@ -323,54 +322,50 @@ export default function Sidebar() {
     return currentWorkspaceSlug && currentProjectSlug
       ? [
           {
-            name: "Overview",
+            name: t("overview"),
             href: `/${currentWorkspaceSlug}/${currentProjectSlug}`,
             icon: <HiViewBoards size={16} />,
-            title: "Project Overview",
+            title: t("projectOverview"),
             disabled: false,
           },
           {
-            name: "Tasks",
+            name: t("tasks"),
             href: `/${currentWorkspaceSlug}/${currentProjectSlug}/tasks`,
             icon: <HiClipboardList size={16} />,
-            title: "Tasks",
+            title: t("tasks"),
             disabled: false,
           },
           {
-            name: "Sprints",
+            name: t("sprints"),
             href: `/${currentWorkspaceSlug}/${currentProjectSlug}/sprints`,
             icon: <HiLightningBolt size={16} />,
-            title: "Sprints",
+            title: t("sprints"),
             disabled: false,
           },
           {
-            name: "Calendar",
+            name: t("calendar"),
             href: `/${currentWorkspaceSlug}/${currentProjectSlug}/calendar`,
             icon: <HiCalendar size={16} />,
-            title: "Calendar",
+            title: t("calendar"),
             disabled: false,
           },
-          ...(!isViewer
-            ? [
-                {
-                  name: "Members",
-                  href: `/${currentWorkspaceSlug}/${currentProjectSlug}/members`,
-                  icon: <HiUsers size={16} />,
-                  title: "Members",
-                  disabled: false,
-                },
-                {
-                  name: "Settings",
-                  href: `/${currentWorkspaceSlug}/${currentProjectSlug}/settings`,
-                  icon: <HiCog size={16} />,
-                  title: "Settings",
-                  disabled: false,
-                },
-              ]
-            : []),
+          {
+            name: t("members"),
+            href: `/${currentWorkspaceSlug}/${currentProjectSlug}/members`,
+            icon: <HiUsers size={16} />,
+            title: t("members"),
+            disabled: false,
+          },
+          {
+            name: t("settings"),
+            href: `/${currentWorkspaceSlug}/${currentProjectSlug}/settings`,
+            icon: <HiCog size={16} />,
+            title: t("settings"),
+            disabled: false,
+          },
         ]
       : [];
-  }, [currentWorkspaceSlug, currentProjectSlug, isAuth, isViewer, defaultProjectNavItems]);
+  }, [currentWorkspaceSlug, currentProjectSlug, isAuth, defaultProjectNavItems, t]);
 
   const navigationItems: NavItem[] = useMemo(() => {
     // For unauthenticated users, always show project navigation (disabled)
@@ -484,7 +479,7 @@ export default function Sidebar() {
                 <HiViewBoards size={16} />
               </div>
               <span className="layout-sidebar-header-dashboard-title">
-                {currentProject ? currentProject.name : "Project"}
+                {currentProject ? currentProject.name : t("project")}
               </span>
             </div>
           </div>
@@ -548,7 +543,7 @@ export default function Sidebar() {
                     }`}
                     onClick={handleDisabledClick}
                     style={{ cursor: "pointer", opacity: 0.6 }}
-                    title="Login required to access this feature"
+                    title={t("loginRequired")}
                   >
                     <span className="layout-sidebar-nav-link-icon">{item.icon}</span>
                     <span className="layout-sidebar-nav-link-text">{item.name}</span>
@@ -586,7 +581,7 @@ export default function Sidebar() {
             <div className="mt-4 mb-2 mx-3 border-t border-[var(--sidebar-border)]" />
             <div className="flex items-center justify-between px-3 mb-1">
               <span className="text-[10px] font-semibold text-[var(--sidebar-muted)] uppercase tracking-wider">
-              Workspaces
+              {t("workspaces")}
               </span>
             </div>
             <WorkspaceTree currentWorkspaceSlug={currentWorkspaceSlug} />
@@ -609,13 +604,14 @@ export default function Sidebar() {
     }
     return (
       <div className="layout-sidebar-mini">
-        <button
-          onClick={() => toggleSidebar(!isSidebarCollapsed)}
-          className="layout-sidebar-mini-expand-button"
-          title="Expand navigation"
-        >
-          <HiMenu size={16} />
-        </button>
+        <Tooltip content={t("expandNavigation")} position="right">
+          <button
+            onClick={() => toggleSidebar(!isSidebarCollapsed)}
+            className="layout-sidebar-mini-expand-button"
+          >
+            <HiMenu size={16} />
+          </button>
+        </Tooltip>
 
         <div className="layout-sidebar-mini-nav">
           {miniSidebarNavItems.map((item) => {
@@ -628,31 +624,31 @@ export default function Sidebar() {
               : {};
 
             return item.disabled ? (
-              <div
-                key={item.name}
-                className={`layout-sidebar-mini-nav-link layout-sidebar-mini-nav-link-disabled ${
-                  isItemActive
-                    ? "layout-sidebar-nav-link-active"
-                    : "layout-sidebar-mini-nav-link-inactive"
-                }`}
-                title="Login required to access this feature"
-                {...linkProps}
-              >
-                {item.icon}
-              </div>
+              <Tooltip key={item.name} content={t("loginRequired")} position="right">
+                <div
+                  className={`layout-sidebar-mini-nav-link layout-sidebar-mini-nav-link-disabled ${
+                    isItemActive
+                      ? "layout-sidebar-nav-link-active"
+                      : "layout-sidebar-mini-nav-link-inactive"
+                  }`}
+                  {...linkProps}
+                >
+                  {item.icon}
+                </div>
+              </Tooltip>
             ) : (
-              <Link
-                key={item.name}
-                href={item.href}
-                className={`layout-sidebar-mini-nav-link ${
-                  isItemActive
-                    ? "layout-sidebar-nav-link-active"
-                    : "layout-sidebar-mini-nav-link-inactive"
-                }`}
-                title={item.title || item.name}
-              >
-                {item.icon}
-              </Link>
+              <Tooltip key={item.name} content={item.title || item.name} position="right">
+                <Link
+                  href={item.href}
+                  className={`layout-sidebar-mini-nav-link ${
+                    isItemActive
+                      ? "layout-sidebar-nav-link-active"
+                      : "layout-sidebar-mini-nav-link-inactive"
+                  }`}
+                >
+                  {item.icon}
+                </Link>
+              </Tooltip>
             );
           })}
         </div>
@@ -670,13 +666,14 @@ export default function Sidebar() {
   return (
     <>
       {isSidebarCollapsed && (
-        <button
-          onClick={() => toggleSidebar(!isSidebarCollapsed)}
-          className="layout-sidebar-toggle-button"
-          title="Show navigation"
-        >
-          <HiMenu size={16} />
-        </button>
+        <Tooltip content={t("showNavigation")} position="right">
+          <button
+            onClick={() => toggleSidebar(!isSidebarCollapsed)}
+            className="layout-sidebar-toggle-button"
+          >
+            <HiMenu size={16} />
+          </button>
+        </Tooltip>
       )}
 
       <div className="layout-sidebar-container">

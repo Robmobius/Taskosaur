@@ -74,6 +74,7 @@ interface FormData {
   storyPoints: string;
   sprintId?: string;
   parentTaskId?: string;
+  subtasks: { title: string }[];
 }
 
 interface NewTaskModalProps {
@@ -100,8 +101,8 @@ export function NewTaskModal({
 
   const { getWorkspacesByOrganization, getCurrentOrganizationId, getWorkspaceBySlug } =
     useWorkspace();
-  const { getProjectsByWorkspace, getTaskStatusByProject, getProjectMembers } = useProject();
-  const { createTask } = useTask();
+  const { getProjectsByWorkspace, getTaskStatusByProject } = useProject();
+  const { createTask, createSubtask } = useTask();
   const { fetchAnalyticsData } = useProject();
   const { getSprintsByProject, getActiveSprint } = useSprint();
   const { getCurrentUser } = useAuth();
@@ -125,6 +126,7 @@ export function NewTaskModal({
     storyPoints: "",
     sprintId: "",
     parentTaskId: "",
+    subtasks: [],
   });
 
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -349,7 +351,7 @@ export function NewTaskModal({
       const project = projectsData.find((p) => p.slug === projectSlug);
 
       if (!project) {
-        throw new Error(t("projectTasksDescription", { name: projectSlug }));
+        throw new Error(t("modal.errorLoadProject"));
       }
 
       setFormData((prev) => ({
@@ -446,10 +448,10 @@ export function NewTaskModal({
       ]);
       setSprints(projectSprints || []);
 
-      if (sprintIdProp) {
-        setFormData(prev => ({ ...prev, sprintId: sprintIdProp }));
-      } else if (urlContext.sprintId && projectSprints?.some((s: any) => s.id === urlContext.sprintId)) {
-        setFormData(prev => ({ ...prev, sprintId: urlContext.sprintId }));
+      const targetSprint = projectSprints?.find((s: any) => s.id === urlContext.sprintId || s.slug === urlContext.sprintId);
+
+      if (targetSprint) {
+        setFormData(prev => ({ ...prev, sprintId: targetSprint.id }));
       } else if (activeSprint) {
         setFormData(prev => ({ ...prev, sprintId: activeSprint.id }));
       } else if (projectSprints && projectSprints.length > 0) {
@@ -542,7 +544,27 @@ export function NewTaskModal({
         const resolvedSprintId = sprintIdProp || formData.sprintId;
         if (resolvedSprintId) taskData.sprintId = resolvedSprintId;
         if (formData.type === "SUBTASK" && formData.parentTaskId) taskData.parentTaskId = formData.parentTaskId;
-        await createTask(taskData);
+        const createdTask = await createTask(taskData);
+
+        if (formData.type !== "SUBTASK" && formData.subtasks.length > 0) {
+          const validSubtasks = formData.subtasks.filter(st => st.title.trim() !== "");
+          if (validSubtasks.length > 0) {
+            await Promise.all(
+              validSubtasks.map(st =>
+                createSubtask({
+                  title: st.title.trim(),
+                  description: "",
+                  priority: formData.priority as any,
+                  type: "SUBTASK",
+                  projectId: formData.project!.id,
+                  statusId: defaultStatus?.id,
+                  parentTaskId: createdTask.id,
+                  ...(formData.sprintId ? { sprintId: formData.sprintId } : {})
+                })
+              )
+            );
+          }
+        }
 
         if (projectSlug && workspaceSlug) {
           try {
@@ -591,6 +613,7 @@ export function NewTaskModal({
       storyPoints: "",
       sprintId: "",
       parentTaskId: "",
+      subtasks: [],
     });
 
     setWorkspaces([]);
@@ -1093,96 +1116,56 @@ export function NewTaskModal({
             </div>
           </div>
 
-          {/* Status */}
-          {taskStatuses.length > 0 && (
+          {formData.type !== "SUBTASK" && (
             <div className="projects-form-field mt-4">
               <Label className="projects-form-label">
-                <HiTag className="projects-form-label-icon" style={{ color: "hsl(var(--primary))" }} />
-                {t("modal.status", "Status")}
+                <HiClipboardList
+                  className="projects-form-label-icon"
+                  style={{ color: "hsl(var(--primary))" }}
+                />
+                {t("modal.subtasks", "Subtasks")}
               </Label>
-              <Select
-                value={formData.statusId}
-                onValueChange={(value) => setFormData((prev) => ({ ...prev, statusId: value }))}
-                disabled={isSubmitting}
-              >
-                <SelectTrigger className="projects-workspace-button border-none" onFocus={(e) => { e.currentTarget.style.boxShadow = "none"; }} onBlur={(e) => { e.currentTarget.style.boxShadow = "none"; }}>
-                  <SelectValue placeholder={t("modal.selectStatus", "Select status")} />
-                </SelectTrigger>
-                <SelectContent className="border-none bg-[var(--card)]">
-                  {taskStatuses.map((s) => (
-                    <SelectItem key={s.id} value={s.id} className="hover:bg-[var(--hover-bg)]">{s.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
-
-          {/* Assignees */}
-          {projectMembers.length > 0 && (
-            <div className="projects-form-field mt-4">
-              <Label className="projects-form-label">
-                <HiBuildingOffice2 className="projects-form-label-icon" style={{ color: "hsl(var(--primary))" }} />
-                {t("modal.assignees", "Assignees")}
-              </Label>
-              <div className="flex flex-wrap gap-2">
-                {projectMembers.map((m: any) => {
-                  const userId = m.user?.id || m.userId || m.id;
-                  const name = m.user ? `${m.user.firstName} ${m.user.lastName}`.trim() : m.name || m.email || userId;
-                  const selected = formData.assigneeIds.includes(userId);
-                  return (
-                    <button
-                      key={userId}
+              <div className="flex flex-col gap-2 mt-2">
+                {formData.subtasks.map((subtask, index) => (
+                  <div key={index} className="flex items-center gap-2">
+                    <Input
+                      value={subtask.title}
+                      onChange={(e) => {
+                        const newSubtasks = [...formData.subtasks];
+                        newSubtasks[index].title = e.target.value;
+                        setFormData((prev) => ({ ...prev, subtasks: newSubtasks }));
+                      }}
+                      placeholder={t("modal.subtaskTitle", "Subtask title")}
+                      className="projects-workspace-button border-none"
+                    />
+                    <Button
                       type="button"
-                      onClick={() => setFormData((prev) => ({
-                        ...prev,
-                        assigneeIds: selected
-                          ? prev.assigneeIds.filter((id) => id !== userId)
-                          : [...prev.assigneeIds, userId],
-                      }))}
-                      disabled={isSubmitting}
-                      className={`px-2 py-1 rounded text-xs border transition-colors ${selected ? "bg-[var(--primary)] text-white border-[var(--primary)]" : "border-[var(--border)] hover:bg-[var(--accent)]"}`}
+                      variant="ghost"
+                      onClick={() => {
+                        const newSubtasks = formData.subtasks.filter((_, i) => i !== index);
+                        setFormData((prev) => ({ ...prev, subtasks: newSubtasks }));
+                      }}
+                      className="text-[var(--destructive)] hover:bg-[var(--destructive)]/10"
                     >
-                      {name}
-                    </button>
-                  );
-                })}
+                      {t("modal.remove", "Remove")}
+                    </Button>
+                  </div>
+                ))}
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setFormData((prev) => ({ ...prev, subtasks: [...prev.subtasks, { title: "" }] }));
+                  }}
+                  className="w-full"
+                >
+                  {t("modal.addSubtask", "+ Add Subtask")}
+                </Button>
               </div>
             </div>
           )}
 
-          {/* Labels */}
-          {projectLabels.length > 0 && (
-            <div className="projects-form-field mt-4">
-              <Label className="projects-form-label">
-                <HiTag className="projects-form-label-icon" style={{ color: "hsl(var(--primary))" }} />
-                {t("modal.labels", "Labels")}
-              </Label>
-              <div className="flex flex-wrap gap-2">
-                {projectLabels.map((label: any) => {
-                  const selected = formData.labelIds.includes(label.id);
-                  return (
-                    <button
-                      key={label.id}
-                      type="button"
-                      onClick={() => setFormData((prev) => ({
-                        ...prev,
-                        labelIds: selected
-                          ? prev.labelIds.filter((id) => id !== label.id)
-                          : [...prev.labelIds, label.id],
-                      }))}
-                      disabled={isSubmitting}
-                      className={`px-2 py-1 rounded text-xs border transition-colors ${selected ? "border-transparent text-white" : "border-[var(--border)] hover:bg-[var(--accent)]"}`}
-                      style={selected ? { backgroundColor: label.color || "hsl(var(--primary))" } : {}}
-                    >
-                      {label.name}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {!urlContext.sprintId && !sprintIdProp && (
+          {!urlContext.sprintId && (
             <div className="projects-form-field mt-4">
               <Label className="projects-form-label">
                 <HiBolt

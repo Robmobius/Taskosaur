@@ -31,8 +31,8 @@ export default function MyApp({ Component, pageProps }: AppProps) {
         <ChatProvider>
           <AppBootstrapper>
             <Component {...pageProps} />
+            <ChatPanel />
           </AppBootstrapper>
-          <ChatPanel />
         </ChatProvider>
       </AuthProvider>
       <Toaster expand={false} richColors closeButton />

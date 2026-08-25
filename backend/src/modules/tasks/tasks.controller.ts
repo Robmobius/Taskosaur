@@ -42,9 +42,11 @@ import { Scope } from 'src/common/decorator/scope.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { BulkDeleteTasksDto } from './dto/bulk-delete-tasks.dto';
 import { BulkUpdateTasksStatusDto } from './dto/bulk-update-task-status.dto';
+import { BulkAssignTasksDto } from './dto/bulk-assign-tasks.dto';
 import { BulkCreateTasksDto } from './dto/bulk-create-tasks.dto';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { RecurrenceConfigDto } from './dto/recurrence-config.dto';
+import { GetGroupedTasksDto } from './dto/get-grouped-tasks.dto';
 import { User } from '../users/entities/user.entity';
 
 @ApiBearerAuth('JWT-auth')
@@ -147,7 +149,7 @@ export class TasksController {
     description: 'Update status of multiple tasks at once.',
   })
   @ApiBody({ type: BulkUpdateTasksStatusDto })
-  @Roles(Role.OWNER, Role.MANAGER)
+  @Roles(Role.OWNER, Role.MANAGER, Role.MEMBER)
   @ApiResponse({
     status: 200,
     description: 'Tasks updated successfully',
@@ -170,6 +172,36 @@ export class TasksController {
   ) {
     return this.tasksService.bulkUpdateTasksStatus({
       ...bulkUpdateDto,
+      userId: user.id,
+    });
+  }
+
+  @Post('bulk-assign')
+  @ApiOperation({
+    summary: 'Bulk assign tasks to users',
+    description: 'Assign one or more users to multiple tasks at once.',
+  })
+  @ApiBody({ type: BulkAssignTasksDto })
+  @Roles(Role.OWNER, Role.MANAGER, Role.MEMBER)
+  @ApiResponse({
+    status: 200,
+    description: 'Tasks assigned successfully',
+    schema: {
+      example: {
+        assignedCount: 5,
+        failedTasks: [
+          {
+            id: '550e8400-e29b-41d4-a716-446655440002',
+            reason: 'Insufficient permissions to update this task',
+          },
+        ],
+      },
+    },
+  })
+  @HttpCode(200)
+  async bulkAssignTasks(@Body() bulkAssignDto: BulkAssignTasksDto, @CurrentUser() user: User) {
+    return this.tasksService.bulkAssignTasks({
+      ...bulkAssignDto,
       userId: user.id,
     });
   }
@@ -543,6 +575,11 @@ export class TasksController {
     description: 'Page size / limit (default: 20)',
     example: 20,
   })
+  @ApiQuery({
+    name: 'groupBy',
+    required: false,
+    description: 'Group by field',
+  })
   @Scope('ORGANIZATION', 'organizationId')
   @Roles(Role.VIEWER, Role.MEMBER, Role.MANAGER, Role.OWNER)
   findAll(
@@ -562,6 +599,7 @@ export class TasksController {
     @Query('sortOrder') sortOrder?: string,
     @Query('page') page = '1',
     @Query('limit') limit = '20',
+    @Query('groupBy') groupBy?: string,
   ) {
     return this.tasksService.findAll(
       organizationId,
@@ -580,6 +618,7 @@ export class TasksController {
       sortOrder,
       Number(page),
       Number(limit),
+      groupBy,
     );
   }
 
@@ -671,6 +710,10 @@ export class TasksController {
     @Query('viewType') viewType: ViewType = ViewType.LIST,
     @Query('page') page: string = '1',
     @Query('limit') limit: string = '20',
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('dateField') dateField: string = 'dueDate',
+    @Query('groupBy') groupBy?: string,
   ) {
     return this.tasksService.getTasks(
       organizationId,
@@ -688,7 +731,57 @@ export class TasksController {
       Number(page),
       Number(limit),
       viewType,
+      from ? new Date(from) : undefined,
+      to ? new Date(to) : undefined,
+      dateField,
+      groupBy,
     );
+  }
+
+  @Get('grouped')
+  @ApiOperation({
+    summary: 'Get tasks grouped by a field',
+    description:
+      'Returns tasks grouped by status, priority, project, assignee, type, dueDate, or createdAt. ' +
+      'Each group includes the first page of tasks AND the total DB count for that group, ' +
+      'enabling accurate totals for large datasets without loading every page.',
+  })
+  @ApiQuery({ name: 'organizationId', required: true, description: 'Organization ID' })
+  @ApiQuery({
+    name: 'groupBy',
+    required: true,
+    description: 'Field to group by',
+    example: 'status',
+  })
+  @ApiQuery({ name: 'workspaceId', required: false })
+  @ApiQuery({ name: 'projectId', required: false })
+  @ApiQuery({ name: 'sprintId', required: false })
+  @ApiQuery({ name: 'priorities', required: false })
+  @ApiQuery({ name: 'statuses', required: false })
+  @ApiQuery({ name: 'types', required: false })
+  @ApiQuery({ name: 'assigneeIds', required: false })
+  @ApiQuery({ name: 'reporterIds', required: false })
+  @ApiQuery({ name: 'search', required: false })
+  @ApiQuery({
+    name: 'limitPerGroup',
+    required: false,
+    description: 'Tasks per group per page (default 20)',
+  })
+  @ApiQuery({
+    name: 'groupKey',
+    required: false,
+    description:
+      "Load-more mode: when set, only this group's tasks are returned using `page` for offset pagination.",
+  })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    description: 'Page within the specified groupKey (1-based, default 1)',
+  })
+  @Scope('ORGANIZATION', 'organizationId')
+  @Roles(Role.VIEWER, Role.MEMBER, Role.MANAGER, Role.OWNER)
+  getGroupedTasks(@CurrentUser() user: User, @Query() dto: GetGroupedTasksDto) {
+    return this.tasksService.getTasksGrouped(dto, user.id);
   }
 
   @Get('by-status')
@@ -741,8 +834,13 @@ export class TasksController {
   }
 
   @Get(':id')
-  findOne(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: User) {
+  findOne(@Param('id') id: string, @CurrentUser() user: User) {
     return this.tasksService.findOne(id, user.id);
+  }
+
+  @Get('slug/:slug')
+  findBySlug(@Param('slug') slug: string, @CurrentUser() user: User) {
+    return this.tasksService.findOne(slug, user.id);
   }
 
   @Get('key/:key')
@@ -781,9 +879,13 @@ export class TasksController {
     summary: 'Update relative task rank',
     description: 'Updates a tasks rank relative to neighbors in a specific scope',
   })
-  async updateRelativeRank(@Param('id') taskId: string, @Body() dto: any) {
+  async updateRelativeRank(
+    @Param('id') taskId: string,
+    @Body() dto: any,
+    @CurrentUser() user: User,
+  ) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-    return this.tasksService.reorderTask(taskId, dto);
+    return this.tasksService.reorderTask(taskId, user.id, dto);
   }
 
   @Patch(':id')
@@ -801,11 +903,7 @@ export class TasksController {
     title: 'Task Updated',
     message: 'A task you are involved in has been updated',
   })
-  update(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body() updateTaskDto: UpdateTaskDto,
-    @CurrentUser() user: User,
-  ) {
+  update(@Param('id') id: string, @Body() updateTaskDto: UpdateTaskDto, @CurrentUser() user: User) {
     return this.tasksService.update(id, updateTaskDto, user.id);
   }
 
@@ -825,7 +923,7 @@ export class TasksController {
     message: 'Task status has been changed',
   })
   updateStatus(
-    @Param('id', ParseUUIDPipe) id: string,
+    @Param('id') id: string,
     @Body('statusId', ParseUUIDPipe) statusId: string,
     @CurrentUser() user: User,
   ) {
@@ -848,7 +946,7 @@ export class TasksController {
     message: 'You have been assigned to a task',
   })
   updateAssignees(
-    @Param('id', ParseUUIDPipe) id: string,
+    @Param('id') id: string,
     @Body('assigneeIds') assigneeIds: string[],
     @CurrentUser() user: User,
   ) {
@@ -870,7 +968,7 @@ export class TasksController {
     title: 'Task Unassigned',
     message: 'You have been unassigned from a task',
   })
-  unassignTask(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: User) {
+  unassignTask(@Param('id') id: string, @CurrentUser() user: User) {
     return this.tasksService.update(id, { assigneeIds: [] }, user.id);
   }
 
@@ -888,7 +986,7 @@ export class TasksController {
     title: 'Task Deleted',
     message: 'A task you were involved in has been deleted',
   })
-  remove(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: User) {
+  remove(@Param('id') id: string, @CurrentUser() user: User) {
     return this.tasksService.remove(id, user.id);
   }
 
@@ -917,7 +1015,7 @@ export class TasksController {
     description: 'Completed recurring task occurrence',
     includeNewValue: true,
   })
-  async completeOccurrence(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: User) {
+  async completeOccurrence(@Param('id') id: string, @CurrentUser() user: User) {
     return this.tasksService.completeOccurrenceAndGenerateNext(id, user.id);
   }
 
@@ -961,7 +1059,7 @@ export class TasksController {
     description: 'Task is already a recurring task',
   })
   addRecurrence(
-    @Param('id', ParseUUIDPipe) id: string,
+    @Param('id') id: string,
     @Body() config: RecurrenceConfigDto,
     @CurrentUser() user: User,
   ) {
@@ -1029,7 +1127,7 @@ export class TasksController {
     description: 'Task is not a recurring task',
   })
   updateRecurrence(
-    @Param('id', ParseUUIDPipe) id: string,
+    @Param('id') id: string,
     @Body() config: RecurrenceConfigDto,
     @CurrentUser() user: User,
   ) {
@@ -1049,7 +1147,7 @@ export class TasksController {
     status: 400,
     description: 'Task is not a recurring task',
   })
-  stopRecurrence(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: User) {
+  stopRecurrence(@Param('id') id: string, @CurrentUser() user: User) {
     return this.tasksService.stopRecurrence(id, user.id);
   }
 
@@ -1086,11 +1184,7 @@ export class TasksController {
     title: 'New Comment',
     message: 'Someone commented on a task you are involved in',
   })
-  addComment(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body('comment') comment: string,
-    @CurrentUser() user: User,
-  ) {
+  addComment(@Param('id') id: string, @Body('comment') comment: string, @CurrentUser() user: User) {
     return this.tasksService.addComment(id, comment, user.id);
   }
 
@@ -1110,7 +1204,7 @@ export class TasksController {
     message: 'Task priority has been changed',
   })
   updatePriority(
-    @Param('id', ParseUUIDPipe) id: string,
+    @Param('id') id: string,
     @Body('priority') priority: TaskPriority,
     @CurrentUser() user: User,
   ) {
@@ -1133,7 +1227,7 @@ export class TasksController {
     message: 'Task due date has been changed',
   })
   updateDueDate(
-    @Param('id', ParseUUIDPipe) id: string,
+    @Param('id') id: string,
     @Body('dueDate') dueDate: string,
     @CurrentUser() user: User,
   ) {

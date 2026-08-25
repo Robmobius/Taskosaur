@@ -31,13 +31,14 @@ describe('ProjectsController (e2e)', () => {
     jwtService = app.get<JwtService>(JwtService);
 
     // Create a test user
+    const uniqueSuffix = Math.random().toString(36).substring(2, 8);
     user = await prismaService.user.create({
       data: {
-        email: `proj-test-${Date.now()}@example.com`,
+        email: `proj-test-${uniqueSuffix}-${Date.now()}@example.com`,
         password: 'StrongPassword123!',
         firstName: 'Project',
         lastName: 'Manager',
-        username: `proj_mgr_${Date.now()}`,
+        username: `proj_mgr_${uniqueSuffix}_${Date.now()}`,
         role: Role.OWNER, // Needs to be OWNER or MANAGER to create projects
       },
     });
@@ -64,8 +65,8 @@ describe('ProjectsController (e2e)', () => {
     // Create Organization
     const organization = await prismaService.organization.create({
       data: {
-        name: `Test Org ${Date.now()}`,
-        slug: `test-org-${Date.now()}`,
+        name: `Test Org ${uniqueSuffix} ${Date.now()}`,
+        slug: `test-org-${uniqueSuffix}-${Date.now()}`,
         ownerId: user.id,
       },
     });
@@ -108,8 +109,8 @@ describe('ProjectsController (e2e)', () => {
     // Create a workspace
     const workspace = await prismaService.workspace.create({
       data: {
-        name: `Test Workspace ${Date.now()}`,
-        slug: `test-workspace-${Date.now()}`,
+        name: `Test Workspace ${uniqueSuffix} ${Date.now()}`,
+        slug: `test-workspace-${uniqueSuffix}-${Date.now()}`,
         organizationId: organization.id,
       },
     });
@@ -208,7 +209,7 @@ describe('ProjectsController (e2e)', () => {
 
   describe('/projects/:id (PATCH)', () => {
     it('should update the project', () => {
-      const updateData = { name: 'Updated Project Name' };
+      const updateData = { name: 'Updated E2E Project Name' };
       return request(app.getHttpServer())
         .patch(`/api/projects/${projectId}`)
         .set('Authorization', `Bearer ${accessToken}`)
@@ -390,6 +391,40 @@ describe('ProjectsController (e2e)', () => {
           const archivedProject = res.body.find((p: any) => p.id === projectToArchiveId);
           expect(archivedProject).toBeUndefined();
         });
+    });
+  });
+
+  describe('/projects/bulk-health-stats (GET)', () => {
+    let testProjectId: string;
+
+    beforeAll(async () => {
+      // Create a separate project for stats test
+      const statsDto = { ...createProjectDto, slug: `stats-test-${Date.now()}` };
+      const res = await request(app.getHttpServer())
+        .post('/api/projects')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send(statsDto);
+      testProjectId = res.body.id;
+    });
+
+    it('should retrieve bulk health stats for projects', () => {
+      return request(app.getHttpServer())
+        .get('/api/projects/bulk-health-stats')
+        .query({ projectIds: testProjectId })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body).toHaveProperty(testProjectId);
+          expect(res.body[testProjectId]).toHaveProperty('completionPredictor');
+          expect(res.body[testProjectId]).toHaveProperty('heatmapData');
+        });
+    });
+
+    it('should require projectIds parameter', () => {
+      return request(app.getHttpServer())
+        .get('/api/projects/bulk-health-stats')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.BAD_REQUEST);
     });
   });
 

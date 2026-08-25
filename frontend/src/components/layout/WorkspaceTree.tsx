@@ -1,9 +1,11 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { useRouter } from "next/router";
 import { HiChevronRight, HiChevronDown, HiViewGrid } from "react-icons/hi";
 import { Workspace } from "@/types";
 import { useWorkspace } from "@/contexts/workspace-context";
 import { cn } from "@/lib/utils";
+import { isValidSlug } from "@/utils/slugUtils";
 import {
   DndContext,
   DragOverlay,
@@ -71,7 +73,9 @@ function DraggableTreeItem({
     if (isDragging) return;
     e.preventDefault();
     e.stopPropagation();
-    router.push(`/${workspace.slug}`);
+    if (isValidSlug(workspace.slug)) {
+      router.push(`/${workspace.slug}`);
+    }
   };
 
   return (
@@ -163,6 +167,7 @@ function isPointerInRect(
 export default function WorkspaceTree({
   currentWorkspaceSlug,
 }: WorkspaceTreeProps) {
+  const { t } = useTranslation("sidebar");
   const {
     workspaceTree,
     getWorkspaceTree,
@@ -333,7 +338,7 @@ export default function WorkspaceTree({
   if (!tree.length) {
     return (
       <div className="py-2 px-3 text-xs text-[var(--sidebar-muted)] italic">
-        No nested workspaces
+        {t("noNestedWorkspaces")}
       </div>
     );
   }
@@ -359,7 +364,7 @@ export default function WorkspaceTree({
               : "py-3 px-3 opacity-0 pointer-events-none border-transparent"
           )}
         >
-          Drop here to make top-level
+          {t("dropToMakeTopLevel")}
         </div>
       </div>
 

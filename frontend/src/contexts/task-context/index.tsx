@@ -40,6 +40,10 @@ interface TaskState {
   isLoading: boolean;
   error: string | null;
   taskResponse: PaginatedTaskResponse;
+  currentSort: {
+    sortBy?: string;
+    sortOrder?: string;
+  };
   subtaskPagination: {
     total: number;
     page: number;
@@ -65,6 +69,10 @@ interface TaskContextType extends TaskState {
       viewType?: 'LIST' | 'BOARD' | 'GANTT';
       page?: number;
       limit?: number;
+      from?: string;
+      to?: string;
+      dateField?: string;
+      groupBy?: string;
     }
   ) => Promise<PaginatedTaskResponse>;
 
@@ -107,6 +115,7 @@ interface TaskContextType extends TaskState {
     params?: {
       workspaceId?: string;
       projectId?: string;
+      parentTaskId?: string;
       priorities?: string;
       statuses?: string;
       assignees?: string;
@@ -116,6 +125,7 @@ interface TaskContextType extends TaskState {
       sortOrder?: string;
       page?: number;
       limit?: number;
+      groupBy?: string;
     }
   ) => Promise<PaginatedTaskResponse>;
   getTasksByOrganization: (
@@ -133,6 +143,7 @@ interface TaskContextType extends TaskState {
       status?: string;
       priority?: string;
       type?: string;
+      parentTaskId?: string;
     }
   ) => Promise<PaginatedTaskResponse>;
   getTasksBySprint: (organizationId: string, sprintId: string) => Promise<Task[]>;
@@ -175,6 +186,26 @@ interface TaskContextType extends TaskState {
     organizationId?: string;
   }) => Promise<{
     updatedCount: number;
+    updatedTasks: Task[];
+    failedTasks: Array<{ id: string; reason: string }>;
+  }>;
+  bulkAssignTasks: (params: {
+    taskIds?: string[];
+    projectId?: string;
+    all?: boolean;
+    excludedIds?: string[];
+    assigneeIds: string[];
+    search?: string;
+    statuses?: string;
+    priorities?: string;
+    types?: string;
+    assignees?: string;
+    reporters?: string;
+    sprintId?: string;
+    workspaceId?: string;
+    organizationId?: string;
+  }) => Promise<{
+    assignedCount: number;
     updatedTasks: Task[];
     failedTasks: Array<{ id: string; reason: string }>;
   }>;
@@ -297,14 +328,16 @@ export function TaskProvider({ children }: TaskProviderProps) {
     taskStatuses: [],
     isLoading: false,
     error: null,
-    taskResponse: null,
+    taskResponse: { data: [], total: 0, page: 1, limit: 10, totalPages: 0 },
+    currentSort: { sortBy: "listRank", sortOrder: "asc" },
     subtaskPagination: null,
   });
 
   // Helper to handle API operations with error handling
   const handleApiOperation = useCallback(async function <T>(
     operation: () => Promise<T>,
-    loadingState: boolean = true
+    loadingState: boolean = true,
+    setGlobalError: boolean = true
   ): Promise<T> {
     try {
       if (loadingState) {
@@ -320,11 +353,15 @@ export function TaskProvider({ children }: TaskProviderProps) {
       return result;
     } catch (error) {
       const errorMessage = error?.message ? error.message : "An error occurred";
-      setTaskState((prev) => ({
-        ...prev,
-        isLoading: false,
-        error: errorMessage,
-      }));
+      if (setGlobalError) {
+        setTaskState((prev) => ({
+          ...prev,
+          isLoading: false,
+          error: errorMessage,
+        }));
+      } else {
+        setTaskState((prev) => ({ ...prev, isLoading: false }));
+      }
       throw error;
     }
   }, []);
@@ -382,6 +419,13 @@ export function TaskProvider({ children }: TaskProviderProps) {
           setTaskState((prev) => ({
             ...prev,
             tasks: result.data,
+            taskResponse: result,
+            currentSort: {
+              // Note: getFilteredTasks doesn't currently take sortBy/sortOrder from params,
+              // but we store them anyway for consistency if added later.
+              sortBy: undefined,
+              sortOrder: undefined,
+            },
           }));
         }
 
@@ -402,12 +446,38 @@ export function TaskProvider({ children }: TaskProviderProps) {
       createTask: async (taskData: CreateTaskRequest): Promise<Task> => {
         const result = await handleApiOperation(() => taskApi.createTask(taskData));
 
-        // Add new task to state if it's not a subtask
+        // Add new task to state if it's not a subtask and it belongs on the current page
         if (!result.parentTaskId) {
-          setTaskState((prev) => ({
-            ...prev,
-            tasks: [...prev.tasks, result],
-          }));
+          setTaskState((prev) => {
+            const { page, totalPages } = prev.taskResponse || { page: 1, totalPages: 1 };
+            const { sortBy, sortOrder } = prev.currentSort;
+
+            const isNewAtTop =
+              (sortBy === "createdAt" && sortOrder === "desc") ||
+              (sortBy === "listRank" && sortOrder === "desc");
+
+            const isNewAtBottom =
+              (!sortBy || sortBy === "listRank" || sortBy === "createdAt") &&
+              (sortOrder === "asc" || !sortOrder);
+
+            // If we only have one page, we can always show it
+            if (totalPages <= 1) {
+              const newTasks = isNewAtTop ? [result, ...prev.tasks] : [...prev.tasks, result];
+              return { ...prev, tasks: newTasks };
+            }
+
+            // If we are on Page 1 and new items go to top, prepend
+            if (page === 1 && isNewAtTop) {
+              return { ...prev, tasks: [result, ...prev.tasks] };
+            }
+
+            // If we are on the Last Page and new items go to bottom, append
+            if (page === totalPages && isNewAtBottom) {
+              return { ...prev, tasks: [...prev.tasks, result] };
+            }
+
+            return prev; // Let caller refresh for correct pagination
+          });
         }
 
         return result;
@@ -415,12 +485,38 @@ export function TaskProvider({ children }: TaskProviderProps) {
       createTaskWithAttachements: async (taskData: CreateTaskRequest): Promise<Task> => {
         const result = await handleApiOperation(() => taskApi.createTaskWithAttachements(taskData));
 
-        // Add new task to state if it's not a subtask
+        // Add new task to state if it's not a subtask and it belongs on the current page
         if (!result.parentTaskId) {
-          setTaskState((prev) => ({
-            ...prev,
-            tasks: [...prev.tasks, result],
-          }));
+          setTaskState((prev) => {
+            const { page, totalPages } = prev.taskResponse || { page: 1, totalPages: 1 };
+            const { sortBy, sortOrder } = prev.currentSort;
+
+            const isNewAtTop =
+              (sortBy === "createdAt" && sortOrder === "desc") ||
+              (sortBy === "listRank" && sortOrder === "desc");
+
+            const isNewAtBottom =
+              (!sortBy || sortBy === "listRank" || sortBy === "createdAt") &&
+              (sortOrder === "asc" || !sortOrder);
+
+            // If we only have one page, we can always show it
+            if (totalPages <= 1) {
+              const newTasks = isNewAtTop ? [result, ...prev.tasks] : [...prev.tasks, result];
+              return { ...prev, tasks: newTasks };
+            }
+
+            // If we are on Page 1 and new items go to top, prepend
+            if (page === 1 && isNewAtTop) {
+              return { ...prev, tasks: [result, ...prev.tasks] };
+            }
+
+            // If we are on the Last Page and new items go to bottom, append
+            if (page === totalPages && isNewAtBottom) {
+              return { ...prev, tasks: [...prev.tasks, result] };
+            }
+
+            return prev; // Let caller refresh for correct pagination
+          });
         }
 
         return result;
@@ -451,15 +547,15 @@ export function TaskProvider({ children }: TaskProviderProps) {
         setTaskState((prev) => {
           // Update subtask in subtTask array
           const updatedSubtasks = prev.subtTask.map((subtask) =>
-            subtask.id === subtaskId ? { ...subtask, ...result } : subtask
+            (subtask.id === subtaskId || subtask.slug === subtaskId) ? { ...subtask, ...result } : subtask
           );
           const updatedCurrentTask = prev.currentTask?.childTasks?.some(
-            (child) => child.id === subtaskId
+            (child) => child.id === subtaskId || child.slug === subtaskId
           )
             ? {
               ...prev.currentTask,
               childTasks: prev.currentTask.childTasks.map((child) =>
-                child.id === subtaskId ? { ...child, ...result } : child
+                (child.id === subtaskId || child.slug === subtaskId) ? { ...child, ...result } : child
               ),
             }
             : prev.currentTask;
@@ -478,13 +574,13 @@ export function TaskProvider({ children }: TaskProviderProps) {
         await taskApi.deleteTask(subtaskId);
 
         setTaskState((prev) => {
-          const updatedSubtasks = prev.subtTask.filter((subtask) => subtask.id !== subtaskId);
+          const updatedSubtasks = prev.subtTask.filter((subtask) => subtask.id !== subtaskId && subtask.slug !== subtaskId);
           const updatedCurrentTask = prev.currentTask?.childTasks?.some(
-            (child) => child.id === subtaskId
+            (child) => child.id === subtaskId || child.slug === subtaskId
           )
             ? {
               ...prev.currentTask,
-              childTasks: prev.currentTask.childTasks.filter((child) => child.id !== subtaskId),
+              childTasks: prev.currentTask.childTasks.filter((child) => child.id !== subtaskId && child.slug !== subtaskId),
             }
             : prev.currentTask;
 
@@ -500,6 +596,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
         params?: {
           workspaceId?: string;
           projectId?: string;
+          parentTaskId?: string;
           priorities?: string;
           statuses?: string;
           assignees?: string;
@@ -509,17 +606,19 @@ export function TaskProvider({ children }: TaskProviderProps) {
           sortOrder?: string;
           page?: number;
           limit?: number;
+          groupBy?: string;
         }
       ): Promise<PaginatedTaskResponse> => {
         const result = await taskApi.getAllTasks(organizationId, params);
-        setTaskState((prev) => {
-          const newState = {
-            ...prev,
-            tasks: result.data,
-            taskResponse: result,
-          };
-          return newState;
-        });
+        setTaskState((prev) => ({
+          ...prev,
+          tasks: result.data,
+          taskResponse: result,
+          currentSort: {
+            sortBy: params?.sortBy,
+            sortOrder: params?.sortOrder,
+          },
+        }));
         return result;
       },
 
@@ -539,6 +638,10 @@ export function TaskProvider({ children }: TaskProviderProps) {
           viewType?: 'LIST' | 'BOARD' | 'GANTT';
           page?: number;
           limit?: number;
+          from?: string;
+          to?: string;
+          dateField?: string;
+          groupBy?: string;
         }
       ): Promise<PaginatedTaskResponse> => {
         if (!organizationId) {
@@ -553,6 +656,10 @@ export function TaskProvider({ children }: TaskProviderProps) {
           ...prev,
           tasks: result.data,
           taskResponse: result,
+          currentSort: {
+            sortBy: params?.sortBy,
+            sortOrder: params?.sortOrder,
+          },
         }));
 
         return result;
@@ -590,20 +697,22 @@ export function TaskProvider({ children }: TaskProviderProps) {
           status?: string;
           priority?: string;
           type?: string;
+          parentTaskId?: string;
         }
       ): Promise<PaginatedTaskResponse> => {
         const result = await handleApiOperation(() =>
           taskApi.getPublicProjectTasks(workspaceSlug, projectSlug, filters)
         );
 
-        setTaskState((prev) => {
-          const newState = {
-            ...prev,
-            tasks: result.data,
-            taskResponse: result,
-          };
-          return newState;
-        });
+        setTaskState((prev) => ({
+          ...prev,
+          tasks: result.data,
+          taskResponse: result,
+          currentSort: {
+            sortBy: "listRank",
+            sortOrder: "asc",
+          },
+        }));
         return result;
       },
 
@@ -679,18 +788,18 @@ export function TaskProvider({ children }: TaskProviderProps) {
         const result = await handleApiOperation(() => taskApi.updateTask(taskId, taskData), false);
         setTaskState((prev) => ({
           ...prev,
-          tasks: prev.tasks.map((task) => (task.id === taskId ? { ...task, ...result } : task)),
+          tasks: prev.tasks.map((task) => (task.id === taskId || task.slug === taskId ? { ...task, ...result } : task)),
           subtTask: prev.subtTask.map((subtask) =>
-            subtask.id === taskId ? { ...subtask, ...result } : subtask
+            (subtask.id === taskId || subtask.slug === taskId) ? { ...subtask, ...result } : subtask
           ),
           currentTask:
-            prev.currentTask?.id === taskId
+            (prev.currentTask?.id === taskId || prev.currentTask?.slug === taskId)
               ? { ...prev.currentTask, ...result }
-              : prev.currentTask?.childTasks?.some((child) => child.id === taskId)
+              : prev.currentTask?.childTasks?.some((child) => child.id === taskId || child.slug === taskId)
                 ? {
                   ...prev.currentTask,
                   childTasks: prev.currentTask.childTasks.map((child) =>
-                    child.id === taskId ? { ...child, ...result } : child
+                    (child.id === taskId || child.slug === taskId) ? { ...child, ...result } : child
                   ),
                 }
                 : prev.currentTask,
@@ -702,15 +811,15 @@ export function TaskProvider({ children }: TaskProviderProps) {
         await handleApiOperation(() => taskApi.deleteTask(taskId), false);
         setTaskState((prev) => ({
           ...prev,
-          tasks: prev.tasks.filter((task) => task.id !== taskId),
-          subtTask: prev.subtTask.filter((subtask) => subtask.id !== taskId),
+          tasks: prev.tasks.filter((task) => task.id !== taskId && task.slug !== taskId),
+          subtTask: prev.subtTask.filter((subtask) => subtask.id !== taskId && subtask.slug !== taskId),
           currentTask:
-            prev.currentTask?.id === taskId
+            (prev.currentTask?.id === taskId || prev.currentTask?.slug === taskId)
               ? null
-              : prev.currentTask?.childTasks?.some((child) => child.id === taskId)
+              : prev.currentTask?.childTasks?.some((child) => child.id === taskId || child.slug === taskId)
                 ? {
                   ...prev.currentTask,
-                  childTasks: prev.currentTask.childTasks.filter((child) => child.id !== taskId),
+                  childTasks: prev.currentTask.childTasks.filter((child) => child.id !== taskId && child.slug !== taskId),
                 }
                 : prev.currentTask,
         }));
@@ -727,6 +836,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
       }> => {
         const result = await handleApiOperation(
           () => taskApi.bulkDeleteTasks(taskIds, projectId, allDelete, excludedIds),
+          true,
           false
         );
 
@@ -740,13 +850,13 @@ export function TaskProvider({ children }: TaskProviderProps) {
           tasks: prev.tasks.filter((task) => !successfullyDeletedIds.includes(task.id)),
           subtTask: prev.subtTask.filter((subtask) => !successfullyDeletedIds.includes(subtask.id)),
           currentTask:
-            prev.currentTask && successfullyDeletedIds.includes(prev.currentTask.id)
+            prev.currentTask && (successfullyDeletedIds.includes(prev.currentTask.id) || successfullyDeletedIds.includes(prev.currentTask.slug))
               ? null
               : prev.currentTask?.childTasks
                 ? {
                   ...prev.currentTask,
                   childTasks: prev.currentTask.childTasks.filter(
-                    (child) => !successfullyDeletedIds.includes(child.id)
+                    (child) => !successfullyDeletedIds.includes(child.id) && !successfullyDeletedIds.includes(child.slug)
                   ),
                 }
                 : prev.currentTask,
@@ -777,6 +887,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
       }> => {
         const result = await handleApiOperation(
           () => taskApi.bulkUpdateTasksStatus(params),
+          true,
           false
         );
 
@@ -789,10 +900,57 @@ export function TaskProvider({ children }: TaskProviderProps) {
                 const updatedTask = result.updatedTasks.find((t: any) => t.id === task.id);
                 return updatedTask ? { ...task, ...updatedTask } : task;
               }),
-              currentTask: result.updatedTasks.find((t: any) => t.id === prev.currentTask?.id)
+              currentTask: result.updatedTasks.find((t: any) => t.id === prev.currentTask?.id || t.slug === prev.currentTask?.slug)
                 ? {
                   ...prev.currentTask,
-                  ...result.updatedTasks.find((t: any) => t.id === prev.currentTask?.id),
+                  ...result.updatedTasks.find((t: any) => t.id === prev.currentTask?.id || t.slug === prev.currentTask?.slug),
+                }
+                : prev.currentTask,
+            };
+          });
+        }
+
+        return result;
+      },
+
+      bulkAssignTasks: async (params: {
+        taskIds?: string[];
+        projectId?: string;
+        all?: boolean;
+        excludedIds?: string[];
+        assigneeIds: string[];
+        search?: string;
+        statuses?: string;
+        priorities?: string;
+        types?: string;
+        assignees?: string;
+        reporters?: string;
+        sprintId?: string;
+        workspaceId?: string;
+        organizationId?: string;
+      }): Promise<{
+        assignedCount: number;
+        updatedTasks: Task[];
+        failedTasks: Array<{ id: string; reason: string }>;
+      }> => {
+        const result = await handleApiOperation(
+          () => taskApi.bulkAssignTasks(params),
+          true,
+          false
+        );
+
+        if (result.updatedTasks && result.updatedTasks.length > 0) {
+          setTaskState((prev) => {
+            return {
+              ...prev,
+              tasks: prev.tasks.map((task) => {
+                const updatedTask = result.updatedTasks.find((t: any) => t.id === task.id);
+                return updatedTask ? { ...task, ...updatedTask } : task;
+              }),
+              currentTask: result.updatedTasks.find((t: any) => t.id === prev.currentTask?.id || t.slug === prev.currentTask?.slug)
+                ? {
+                  ...prev.currentTask,
+                  ...result.updatedTasks.find((t: any) => t.id === prev.currentTask?.id || t.slug === prev.currentTask?.slug),
                 }
                 : prev.currentTask,
             };
@@ -810,9 +968,9 @@ export function TaskProvider({ children }: TaskProviderProps) {
         // Update task in state
         setTaskState((prev) => ({
           ...prev,
-          tasks: prev.tasks.map((task) => (task.id === taskId ? { ...task, statusId } : task)),
+          tasks: prev.tasks.map((task) => (task.id === taskId || task.slug === taskId ? { ...task, statusId } : task)),
           currentTask:
-            prev.currentTask?.id === taskId ? { ...prev.currentTask, statusId } : prev.currentTask,
+            (prev.currentTask?.id === taskId || prev.currentTask?.slug === taskId) ? { ...prev.currentTask, statusId } : prev.currentTask,
         }));
         return result;
       },
@@ -1109,8 +1267,19 @@ export function TaskProvider({ children }: TaskProviderProps) {
 
         setTaskState((prev) => ({
           ...prev,
-          tasks: result.tasks, // ✅ Extract tasks from paginated response
-          pagination: result.pagination, // ✅ Store pagination info
+          tasks: result.tasks,
+          pagination: result.pagination,
+          taskResponse: {
+            data: result.tasks,
+            page: result.pagination.currentPage,
+            totalPages: result.pagination.totalPages,
+            total: result.pagination.totalCount,
+            limit: params.limit || 10,
+          },
+          currentSort: {
+            sortBy: params.sortBy,
+            sortOrder: params.sortOrder,
+          },
         }));
 
         return result;
@@ -1134,6 +1303,24 @@ export function TaskProvider({ children }: TaskProviderProps) {
         }
 
         const result = await handleApiOperation(() => taskApi.getTodayAgenda(orgId, params));
+
+        setTaskState((prev) => ({
+          ...prev,
+          tasks: result.tasks,
+          pagination: result.pagination,
+          taskResponse: {
+            data: result.tasks,
+            page: result.pagination.currentPage,
+            totalPages: result.pagination.totalPages,
+            total: result.pagination.totalCount,
+            limit: params.limit || 10,
+          },
+          currentSort: {
+            sortBy: params.sortBy,
+            sortOrder: params.sortOrder,
+          },
+        }));
+
         return result;
       },
 
@@ -1183,14 +1370,14 @@ export function TaskProvider({ children }: TaskProviderProps) {
         setTaskState((prev) => ({
           ...prev,
           currentTask:
-            prev.currentTask?.id === taskId
+            (prev.currentTask?.id === taskId || prev.currentTask?.slug === taskId)
               ? {
                 ...prev.currentTask,
                 assignees: result.assignees || [],
               }
               : prev.currentTask,
           tasks: prev.tasks.map((task) =>
-            task.id === taskId ? { ...task, assignees: result.assignees || [] } : task
+            (task.id === taskId || task.slug === taskId) ? { ...task, assignees: result.assignees || [] } : task
           ),
         }));
 
@@ -1213,7 +1400,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
               }
               : prev.currentTask,
           tasks: prev.tasks.map((task) =>
-            task.id === taskId
+            (task.id === taskId || task.slug === taskId)
               ? { ...task, recurringConfig: { ...task.recurringConfig, ...recurrenceConfig } }
               : task
           ),
@@ -1231,7 +1418,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
         setTaskState((prev) => ({
           ...prev,
           currentTask:
-            prev.currentTask?.id === taskId
+            (prev.currentTask?.id === taskId || prev.currentTask?.slug === taskId)
               ? {
                 ...prev.currentTask,
                 isRecurring: true,
@@ -1239,7 +1426,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
               }
               : prev.currentTask,
           tasks: prev.tasks.map((task) =>
-            task.id === taskId
+            (task.id === taskId || task.slug === taskId)
               ? { ...task, isRecurring: true, recurringConfig: recurrenceConfig }
               : task
           ),
@@ -1257,7 +1444,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
         setTaskState((prev) => ({
           ...prev,
           currentTask:
-            prev.currentTask?.id === taskId
+            (prev.currentTask?.id === taskId || prev.currentTask?.slug === taskId)
               ? {
                 ...prev.currentTask,
                 isRecurring: false,
@@ -1265,7 +1452,7 @@ export function TaskProvider({ children }: TaskProviderProps) {
               }
               : prev.currentTask,
           tasks: prev.tasks.map((task) =>
-            task.id === taskId
+            (task.id === taskId || task.slug === taskId)
               ? { ...task, isRecurring: false, recurringConfig: null }
               : task
           ),

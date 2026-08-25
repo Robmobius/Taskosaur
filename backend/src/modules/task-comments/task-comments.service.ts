@@ -9,9 +9,8 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { CreateTaskCommentDto } from './dto/create-task-comment.dto';
 import { UpdateTaskCommentDto } from './dto/update-task-comment.dto';
 import { EmailReplyService } from '../inbox/services/email-reply.service';
-import { sanitizeHtml } from 'src/common/utils/sanitizer.util';
+import { sanitizeHtml, sanitizeText } from '../../common/utils/sanitizer.util';
 import { NotificationsService } from '../notifications/notifications.service';
-import { UsersService } from '../users/users.service';
 import { EmailService } from '../email/email.service';
 import { EmailTemplate, EmailPriority } from '../email/dto/email.dto';
 import { ConfigService } from '@nestjs/config';
@@ -31,13 +30,14 @@ const AUTHOR_SELECT_WITH_EMAIL = {
   avatar: true,
 } as const;
 
+const ADMIN_ROLES = ['OWNER', 'MANAGER', 'SUPER_ADMIN'];
+
 @Injectable()
 export class TaskCommentsService {
   constructor(
     private prisma: PrismaService,
     private emailReply: EmailReplyService,
     private notificationsService: NotificationsService,
-    private usersService: UsersService,
     private emailService: EmailService,
     private configService: ConfigService,
   ) {}
@@ -79,9 +79,12 @@ export class TaskCommentsService {
   }
 
   private async checkAccess(userId: string, taskId: string) {
-    const task = await this.prisma.task.findUnique({
-      where: { id: taskId },
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(taskId);
+
+    const task = await this.prisma.task.findFirst({
+      where: isUuid ? { id: taskId } : { slug: taskId },
       select: {
+        id: true,
         projectId: true,
         project: {
           select: {
@@ -104,7 +107,11 @@ export class TaskCommentsService {
       where: { id: task.project.workspace.organizationId },
       select: { id: true, archive: true },
     });
-    if (org?.archive) {
+    if (!org) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    if (org.archive) {
       throw new ForbiddenException('Operation not allowed in an archived organization');
     }
 
@@ -143,6 +150,7 @@ export class TaskCommentsService {
     }
 
     return {
+      taskId: task.id,
       projectRole: user.projectMembers[0]?.role,
       workspaceRole: user.workspaceMembers[0]?.role,
       organizationRole: user.organizationMembers[0]?.role,
@@ -184,16 +192,36 @@ export class TaskCommentsService {
     const matches = [...comment.content.matchAll(mentionRegex)];
     let usernames = [...new Set(matches.map((m) => m[1]))];
 
+    // Extract UUIDs from mentions in links like [@username](/members/UUID) or <a href="/members/UUID">
+    const uuidRegex = /\/members\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
+    const uuidMatches = [...comment.content.matchAll(uuidRegex)];
+    let userIdsFromMentions = [...new Set(uuidMatches.map((m) => m[1]))];
+
+    // Extract UUIDs from new mention format @[mention:UUID]
+    const newMentionRegex =
+      /@\[mention:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\]/gi;
+    const newMentionMatches = [...comment.content.matchAll(newMentionRegex)];
+    const newUserIds = [...new Set(newMentionMatches.map((m) => m[1]))];
+    userIdsFromMentions = [...new Set([...userIdsFromMentions, ...newUserIds])];
+
     if (oldContent) {
       const oldMatches = [...oldContent.matchAll(mentionRegex)];
       const oldUsernames = [...new Set(oldMatches.map((m) => m[1]))];
       usernames = usernames.filter((u) => !oldUsernames.includes(u));
+
+      const oldUuidMatches = [...oldContent.matchAll(uuidRegex)];
+      const oldNewMentionMatches = [...oldContent.matchAll(newMentionRegex)];
+      const oldUserIds = [
+        ...new Set([...oldUuidMatches.map((m) => m[1]), ...oldNewMentionMatches.map((m) => m[1])]),
+      ];
+      // Only keep new user IDs that weren't in the old content
+      userIdsFromMentions = userIdsFromMentions.filter((id) => !oldUserIds.includes(id));
     }
 
-    if (usernames.length > 0) {
+    if (usernames.length > 0 || userIdsFromMentions.length > 0) {
       const mentionedUsers = await this.prisma.user.findMany({
         where: {
-          username: { in: usernames },
+          OR: [{ username: { in: usernames } }, { id: { in: userIdsFromMentions } }],
         },
         select: { id: true, username: true, email: true, firstName: true, lastName: true },
       });
@@ -259,10 +287,8 @@ export class TaskCommentsService {
                         return `<a href="${absoluteUrl}"${suffix}>${username}</a>`;
                       },
                     ),
-                  textContent: comment.content
+                  textContent: sanitizeText(comment.content)
                     .replace(/\[@?([\w.-]+)\]\([^)]+\)/g, '$1')
-                    .replace(/<a[^>]*>@?([\w.-]+)<\/a>/g, '$1')
-                    .replace(/<[^>]*>?/gm, '')
                     .replace(/&nbsp;/g, ' '),
                   entityUrl: `${this.configService.get('FRONTEND_URL', 'http://localhost:3001')}/tasks/${task.slug}`,
                 },
@@ -288,9 +314,11 @@ export class TaskCommentsService {
         ...task.reporters.map((r) => ({ id: r.userId })),
         ...task.watchers.map((w) => ({ id: w.user.id })),
       ];
-      for (const participant of participants) {
-        if (!notifiedUserIds.has(participant.id)) {
-          await this.notificationsService.createNotification({
+      const participantNotifications = participants
+        .filter((participant) => !notifiedUserIds.has(participant.id))
+        .map((participant) => {
+          notifiedUserIds.add(participant.id);
+          return this.notificationsService.createNotification({
             title: 'New Comment',
             message: `${comment.author.firstName} commented on "${task.title}"`,
             type: NotificationType.TASK_COMMENTED,
@@ -302,20 +330,21 @@ export class TaskCommentsService {
             priority: NotificationPriority.MEDIUM,
             createdBy: authorId,
           });
-          notifiedUserIds.add(participant.id);
-        }
+        });
+
+      if (participantNotifications.length > 0) {
+        await Promise.all(participantNotifications);
       }
     }
   }
 
   async create(createTaskCommentDto: CreateTaskCommentDto, userId: string): Promise<TaskComment> {
     const { taskId, parentCommentId } = createTaskCommentDto;
-
-    await this.checkAccess(userId, taskId);
+    const { taskId: resolvedTaskId } = await this.checkAccess(userId, taskId);
 
     // Verify task exists and is not archived
     const task = await this.prisma.task.findUnique({
-      where: { id: taskId },
+      where: { id: resolvedTaskId },
       select: { id: true, title: true, isArchived: true },
     });
 
@@ -348,7 +377,7 @@ export class TaskCommentsService {
         throw new NotFoundException('Parent comment not found');
       }
 
-      if (parentComment.taskId !== taskId) {
+      if (parentComment.taskId !== resolvedTaskId) {
         throw new BadRequestException('Parent comment must belong to the same task');
       }
     }
@@ -356,6 +385,7 @@ export class TaskCommentsService {
     const comment = await this.prisma.taskComment.create({
       data: {
         ...createTaskCommentDto,
+        taskId: resolvedTaskId,
         authorId: userId,
         content: sanitizeHtml(createTaskCommentDto.content),
       },
@@ -412,14 +442,12 @@ export class TaskCommentsService {
     totalPages: number;
     hasMore: boolean;
   }> {
-    await this.checkAccess(userId, taskId);
+    const { taskId: resolvedTaskId } = await this.checkAccess(userId, taskId);
 
-    const whereClause: any = {};
-    if (taskId) {
-      whereClause.taskId = taskId;
-      // Only get top-level comments (not replies)
-      whereClause.parentCommentId = null;
-    }
+    const whereClause: Prisma.TaskCommentWhereInput = {
+      taskId: resolvedTaskId,
+      parentCommentId: null,
+    };
 
     // Get total count for pagination
     const total = await this.prisma.taskComment.count({
@@ -572,7 +600,11 @@ export class TaskCommentsService {
       select: { isArchived: true },
     });
 
-    if (task && task.isArchived) {
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    if (task.isArchived) {
       throw new ForbiddenException('Cannot update comments on an archived task');
     }
 
@@ -629,9 +661,9 @@ export class TaskCommentsService {
     );
 
     const isAdmin =
-      ['OWNER', 'MANAGER', 'SUPER_ADMIN'].includes(projectRole) ||
-      ['OWNER', 'MANAGER', 'SUPER_ADMIN'].includes(workspaceRole) ||
-      ['OWNER', 'MANAGER', 'SUPER_ADMIN'].includes(organizationRole);
+      ADMIN_ROLES.includes(projectRole) ||
+      ADMIN_ROLES.includes(workspaceRole) ||
+      ADMIN_ROLES.includes(organizationRole);
 
     if (comment.authorId !== userId && !isAdmin) {
       throw new ForbiddenException('You can only delete your own comments');
@@ -644,11 +676,11 @@ export class TaskCommentsService {
   }
 
   async getTaskCommentTree(taskId: string, userId: string): Promise<TaskComment[]> {
-    await this.checkAccess(userId, taskId);
+    const { taskId: resolvedTaskId } = await this.checkAccess(userId, taskId);
 
     // Verify task exists
     const task = await this.prisma.task.findUnique({
-      where: { id: taskId },
+      where: { id: resolvedTaskId },
       select: { id: true },
     });
 
@@ -659,7 +691,7 @@ export class TaskCommentsService {
     // Get all comments for the task in a hierarchical structure
     return this.prisma.taskComment.findMany({
       where: {
-        taskId,
+        taskId: resolvedTaskId,
         parentCommentId: null, // Only top-level comments
       },
       include: {
@@ -707,11 +739,11 @@ export class TaskCommentsService {
     hasMore: boolean;
     loadedCount: number; // How many middle comments have been loaded so far
   }> {
-    await this.checkAccess(userId, taskId);
+    const { taskId: resolvedTaskId } = await this.checkAccess(userId, taskId);
 
-    const whereClause: any = {
-      taskId,
-      parentCommentId: null, // Only top-level comments
+    const whereClause: Prisma.TaskCommentWhereInput = {
+      taskId: resolvedTaskId,
+      parentCommentId: null,
     };
 
     // Get total count
@@ -723,6 +755,7 @@ export class TaskCommentsService {
 
     let data: TaskComment[] = [];
     let loadedCount = 0;
+    const middleCount = Math.max(0, total - oldestCount - newestCount);
 
     if (page === 1) {
       // Initial load: Get oldest + newest comments
@@ -751,12 +784,11 @@ export class TaskCommentsService {
         });
 
         // Combine: oldest first, then newest (reversed to maintain chronological order)
-        data = [...oldest, ...newest.reverse()];
+        data = [...oldest, ...[...newest].reverse()];
       }
     } else {
       // Subsequent loads: Get middle comments
       // Ensure we don't accidentally fetch into the "newest" section
-      const middleCount = total - oldestCount - newestCount;
       const endIndex = total - newestCount;
       const skip = oldestCount + (page - 2) * limit;
       const remainingMiddle = Math.max(0, endIndex - skip);
@@ -775,7 +807,6 @@ export class TaskCommentsService {
       loadedCount = Math.min((page - 1) * limit, middleCount);
     }
 
-    const middleCount = Math.max(0, total - oldestCount - newestCount);
     const middlePages = Math.ceil(middleCount / limit);
     const totalPages = middlePages + 1; // +1 for the initial page
     const hasMore = page < totalPages;

@@ -9,7 +9,7 @@ i18n
   .use(initReactI18next)
   .init({
     fallbackLng: 'en',
-    supportedLngs: ['en', 'es', 'fr', 'pt'],
+    supportedLngs: ['en', 'es', 'fr', 'pt', 'de'],
     debug: false,
     interpolation: {
       escapeValue: false,
@@ -24,7 +24,7 @@ i18n
       order: ['querystring', 'cookie', 'localStorage', 'navigator', 'htmlTag'],
       caches: ['localStorage', 'cookie'],
     },
-    ns: ['common', 'projects', 'workspaces', 'workspace-home', 'tasks', 'activities', 'settings', 'sprints', 'calendar', 'analytics', 'members', 'project-members', 'project-settings'],
+    ns: ['common', 'projects', 'workspaces', 'workspace-home', 'tasks', 'activities', 'settings', 'sprints', 'calendar', 'analytics', 'members', 'project-members', 'project-settings', 'integrations'],
     defaultNS: 'common',
     load: 'languageOnly',
   });

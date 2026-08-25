@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import TaskComments from "./TaskComments";
 import Subtasks from "./Subtasks";
@@ -43,6 +43,7 @@ import RecurringBadge from "@/components/common/RecurringBadge";
 import { Repeat, Plus } from "lucide-react";
 import RecurrenceSelector from "@/components/common/RecurrenceSelector";
 import { HiShare } from "react-icons/hi";
+import { cn } from "@/lib/utils";
 
 // Helper function to validate internal paths and prevent open redirect vulnerabilities
 function isValidInternalPath(path: string): boolean {
@@ -130,6 +131,7 @@ export default function TaskDetailClient({
   const [loadingLabels, setLoadingLabels] = useState(true);
   const [initialLoadComplete, setInitialLoadComplete] = useState(false);
   const [minLoadTimeElapsed, setMinLoadTimeElapsed] = useState(false);
+  const descriptionEditorRef = useRef<any>(null);
 
   const [confirmModal, setConfirmModal] = useState({
     isOpen: false,
@@ -234,6 +236,8 @@ export default function TaskDetailClient({
     sprint: false,
   });
   const [allowEmailReplies, setAllowEmailReplies] = useState(task?.allowEmailReplies || false);
+  const isMember = currentUser?.role === "MEMBER";
+  const canEditGeneral = hasAccess && !isMember;
 
   const today = new Date().toISOString().split("T")[0];
   // Exception: Assignee or reporter has access to all actions except Assignment section
@@ -401,40 +405,6 @@ export default function TaskDetailClient({
           return;
         }
         setWorkspaceData(workspace);
-        if (typeof projectSlug === "string") {
-          const projects = await projectContext.getProjectsByWorkspace(workspace.id);
-          const project = findProjectBySlug(projects || [], projectSlug);
-          if (project) {
-            setProjectData(project);
-          }
-        } else {
-          setProjectData(null);
-        }
-      } catch (err) {
-        console.error("Error loading workspace/project data:", err);
-      }
-    };
-
-    loadWorkspaceAndProjectData();
-  }, [workspaceSlug, projectSlug]);
-
-  useEffect(() => {
-    const loadWorkspaceAndProjectData = async () => {
-      try {
-        if (!authContext.isAuthenticated()) {
-          return;
-        }
-
-        if (typeof workspaceSlug !== "string") {
-          return;
-        }
-
-        const workspace = await workspaceContext.getWorkspaceBySlug(workspaceSlug);
-        if (!workspace) {
-          return;
-        }
-        setWorkspaceData(workspace);
-
         if (typeof projectSlug === "string") {
           const projects = await projectContext.getProjectsByWorkspace(workspace.id);
           const project = findProjectBySlug(projects || [], projectSlug);
@@ -830,9 +800,12 @@ export default function TaskDetailClient({
       return;
     }
 
+    // Use the editor ref to get the processed content (with UUIDs for mentions)
+    const processedDescription = descriptionEditorRef.current?.getContent() || descriptionToSave;
+
     // Sanitize description to prevent XSS
-    const sanitizedDescription = descriptionToSave
-      ? sanitizeEditorContent(descriptionToSave.trim())
+    const sanitizedDescription = processedDescription
+      ? sanitizeEditorContent(processedDescription.trim())
       : undefined;
 
     try {
@@ -861,8 +834,14 @@ export default function TaskDetailClient({
         recurrence: false,
         sprint: false,
       });
-      onTaskRefetch && onTaskRefetch();
+      if (!isAIActive()) {
+        onTaskRefetch && onTaskRefetch();
+      }
       toast.success(t("detail.updateTaskSuccess"));
+      // Every other AI-driven update path auto-closes; without this the agent saves the
+      // description and then sits on an open panel, since the prompt forbids it from
+      // closing the modal itself.
+      handleAIAutoClose();
     } catch (error) {
       toast.error(t("detail.updateTaskError"));
     }
@@ -983,13 +962,8 @@ export default function TaskDetailClient({
     return null;
   }
 
-  // Validate task.id before URL construction
+  // Construct detail URL using slug
   const detailUrl = (() => {
-    if (!validator.isUUID(task.id, 4)) {
-      console.error('Invalid task ID format:', task.id);
-      return '';
-    }
-
     const wsSlug = sanitizeSlug(workspaceSlug) || task.project?.workspace?.slug;
     const pgSlug = sanitizeSlug(projectSlug) || task.project?.slug;
 
@@ -1076,7 +1050,7 @@ export default function TaskDetailClient({
             )}
           </div>
 
-          {(hasAccess || task.createdBy === currentUser?.id) && (
+          {canEditGeneral && (
             <div className=" flex gap-2">
               {!task.emailThreadId && (
                 <Tooltip content={t("detail.editTask")} position="left">
@@ -1127,10 +1101,15 @@ export default function TaskDetailClient({
                     className="text-xs bg-[var(--background)] border-[var(--border)]"
                   />
                   <TaskDescription
+                    ref={descriptionEditorRef}
                     value={editTaskData.description}
                     onChange={(value) => handleTaskFieldChange("description", value)}
                     editMode={true}
-                    mentions={projectMembers.map(m => ({ id: m.id, label: m.username, avatar: m.avatar, email: m.email }))}
+                    mentions={projectMembers.map(m => ({
+                      id: m.id,
+                      label: m.username,
+                      avatar: m.avatar
+                    }))}
                   />
                   <div className="flex items-center justify-end gap-4 mt-4">
                     <ActionButton
@@ -1171,7 +1150,7 @@ export default function TaskDetailClient({
               onDownloadAttachment={handleDownloadAttachment}
               onDeleteAttachment={handleDeleteAttachment}
               onDeleteMultipleAttachments={handleDeleteMultipleAttachments}
-              hasAccess={hasAccess}
+              hasAccess={canEditGeneral}
               setLoading={setLoadingAttachments}
             />
 
@@ -1184,7 +1163,7 @@ export default function TaskDetailClient({
                   onSubtaskUpdated={() => { }}
                   onSubtaskDeleted={() => { }}
                   showConfirmModal={showConfirmModal}
-                  isAssignOrRepoter={hasAccess}
+                  isAssignOrRepoter={canEditGeneral}
                   setLoading={setLoadingSubtasks}
                   parentSprintId={task.sprintId || task.sprint?.id}
                   parentStatusId={task.statusId || task.status?.id}
@@ -1206,9 +1185,14 @@ export default function TaskDetailClient({
                 onCommentDeleted={() => {
                   onTaskRefetch && onTaskRefetch();
                 }}
+                onTaskRefetch={onTaskRefetch}
                 hasAccess={hasAccess}
                 setLoading={setLoadingComments}
-                mentions={projectMembers.map(m => ({ id: m.id, label: m.username, avatar: m.avatar, email: m.email }))}
+                mentions={projectMembers.map(m => ({
+                  id: m.id,
+                  label: m.username,
+                  avatar: m.avatar
+                }))}
               />
             </div>
           </div>
@@ -1224,7 +1208,7 @@ export default function TaskDetailClient({
                       <ToggleSwitch
                         checked={allowEmailReplies}
                         onChange={handleEmailRepliesToggle}
-                        disabled={!hasAccess}
+                        disabled={!canEditGeneral}
                         label={t("detail.emailReplies")}
                         size="sm"
                       />
@@ -1232,11 +1216,10 @@ export default function TaskDetailClient({
                   </div>
                 )}
 
-                {/* Task Type */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <Label className="text-sm">{t("detail.taskType")}</Label>
-                    {hasAccess && (
+                    {canEditGeneral && (
                       <button
                         type="button"
                         data-testid="edit-task-type-btn"
@@ -1333,7 +1316,7 @@ export default function TaskDetailClient({
                       <div
                         data-testid="task-type-badge"
                         onClick={() => {
-                          if (hasAccess) {
+                          if (canEditGeneral) {
                             setIsEditingTask((prev) => ({
                               ...prev,
                               taskType: true,
@@ -1344,7 +1327,7 @@ export default function TaskDetailClient({
                             }));
                           }
                         }}
-                        className={hasAccess ? 'cursor-pointer' : ''}
+                        className={canEditGeneral ? 'cursor-pointer' : ''}
                       >
                         <DynamicBadge
                           label={
@@ -1375,7 +1358,7 @@ export default function TaskDetailClient({
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <Label className="text-sm">{t("detail.sprint")}</Label>
-                    {hasAccess && (
+                    {canEditGeneral && (
                       <button
                         type="button"
                         data-testid="edit-sprint-btn"
@@ -1491,7 +1474,7 @@ export default function TaskDetailClient({
                       <div
                         data-testid="sprint-badge"
                         onClick={() => {
-                          if (hasAccess) {
+                          if (canEditGeneral) {
                             setIsEditingTask((prev) => ({
                               ...prev,
                               sprint: true,
@@ -1502,7 +1485,7 @@ export default function TaskDetailClient({
                             }));
                           }
                         }}
-                        className={hasAccess ? 'cursor-pointer' : ''}
+                        className={canEditGeneral ? 'cursor-pointer' : ''}
                       >
                         <DynamicBadge
                           label={
@@ -1527,7 +1510,7 @@ export default function TaskDetailClient({
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <Label className="text-sm">{t("detail.priority")}</Label>
-                    {hasAccess && (
+                    {canEditGeneral && (
                       <button
                         type="button"
                         data-testid="edit-priority-btn"
@@ -1614,6 +1597,7 @@ export default function TaskDetailClient({
                         data-testid="priority-badge"
                         priority={editTaskData?.priority}
                         onClick={() => {
+                          if (!canEditGeneral) return;
                           setIsEditingTask((prev) => ({
                             ...prev,
                             priority: true,
@@ -1623,7 +1607,10 @@ export default function TaskDetailClient({
                             priority: true,
                           }));
                         }}
-                        className="text-[13px] min-w-[120px] min-h-[29.33px]"
+                        className={cn(
+                          "text-[13px] min-w-[120px] min-h-[29.33px]",
+                          canEditGeneral ? "cursor-pointer" : "cursor-default"
+                        )}
                       />
                     )}
                   </div>
@@ -1726,7 +1713,7 @@ export default function TaskDetailClient({
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <Label className="text-sm">{t("detail.dateRange")}</Label>
-                    {hasAccess && (
+                    {canEditGeneral && (
                       <button
                         type="button"
                         data-testid="edit-dates-btn"
@@ -1849,15 +1836,19 @@ export default function TaskDetailClient({
                     ) : (
                       <Badge
                         data-testid="due-date-badge"
-                        onClick={() =>
+                        onClick={() => {
+                          if (!canEditGeneral) return;
                           setIsEditingTask((prev) => ({
                             ...prev,
                             startDate: !prev.startDate,
                             dueDate: !prev.dueDate,
                           }))
-                        }
+                        }}
                         variant="outline"
-                        className="min-w-[120px] min-h-[29.33px] text-[13px] rounded-2xl  px-1.5 py-0.5 bg-[var(--muted)] border-[var(--border)] flex-shrink-0 cursor-pointer"
+                        className={cn(
+                          "min-w-[120px] min-h-[29.33px] text-[13px] rounded-2xl px-1.5 py-0.5 bg-[var(--muted)] border-[var(--border)] flex-shrink-0",
+                          canEditGeneral ? "cursor-pointer" : "cursor-default"
+                        )}
                       >
                         {editTaskData.dueDate
                           ? formatDateForDisplay(editTaskData.dueDate)
@@ -1928,7 +1919,7 @@ export default function TaskDetailClient({
                         <div className="flex items-center gap-2">
                           <RecurringBadge />
                         </div>
-                        {hasAccess && (
+                        {canEditGeneral && (
                           <button
                             type="button"
                             data-testid="edit-recurrence-btn"
@@ -1992,7 +1983,7 @@ export default function TaskDetailClient({
                           </Badge>
                         </div>
                       </div>
-                      {hasAccess && task.recurringConfig.isActive && (
+                      {canEditGeneral && task.recurringConfig.isActive && (
                         <div className="mt-4 pt-4 border-t border-[var(--border)]">
                           <ActionButton
                             onClick={() => {
@@ -2027,7 +2018,7 @@ export default function TaskDetailClient({
             )}
 
             {/* Add Recurrence for non-recurring tasks */}
-            {!task.isRecurring && hasAccess && (
+            {!task.isRecurring && canEditGeneral && (
               <>
                 <Divider label={t("detail.recurrence")} />
                 <div className="space-y-4">
@@ -2108,7 +2099,7 @@ export default function TaskDetailClient({
               <div>
                 <MemberSelect
                   label={t("detail.assignees")}
-                  editMode={isAuth && hasAccess}
+                  editMode={isAuth && canEditGeneral}
                   selectedMembers={assignees}
                   projectId={task.projectId || task.project?.id}
                   onChange={async (newAssignees) => {
@@ -2126,7 +2117,7 @@ export default function TaskDetailClient({
                     }
                   }}
                   members={projectMembers}
-                  disabled={!hasAccess}
+                  disabled={!canEditGeneral}
                   placeholder={projectMembers.length === 0 ? t("detail.noMembers") : t("detail.selectAssignees")}
                 />
               </div>
@@ -2134,7 +2125,7 @@ export default function TaskDetailClient({
                 <MemberSelect
                   label={t("detail.reporters")}
                   selectedMembers={reporters}
-                  editMode={isAuth && hasAccess}
+                  editMode={isAuth && canEditGeneral}
                   projectId={task.projectId || task.project?.id}
                   onChange={async (newReporters) => {
                     setReporters(newReporters);
@@ -2149,7 +2140,7 @@ export default function TaskDetailClient({
                     }
                   }}
                   members={projectMembers}
-                  disabled={!hasAccess}
+                  disabled={!canEditGeneral}
                   placeholder={projectMembers.length === 0 ? t("detail.noMembers") : t("detail.selectReporters")}
                 />
               </div>
@@ -2162,7 +2153,7 @@ export default function TaskDetailClient({
               onAddLabel={handleAddLabel}
               onAssignExistingLabel={handleAssignExistingLabel}
               onRemoveLabel={handleRemoveLabel}
-              hasAccess={hasAccess}
+              hasAccess={canEditGeneral}
               setLoading={setLoadingLabels}
             />
             <Divider label={t("detail.activities")} />

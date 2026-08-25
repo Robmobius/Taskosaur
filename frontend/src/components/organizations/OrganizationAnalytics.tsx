@@ -56,6 +56,7 @@ interface OrganizationAnalyticsProps {
   organizationId: string;
 }
 
+
 // Sortable Widget Component
 function SortableWidget({
   id,
@@ -87,7 +88,7 @@ function SortableWidget({
 }
 
 export function OrganizationAnalytics({ organizationId }: OrganizationAnalyticsProps) {
-  const { t } = useTranslation("workspace-home");
+  const { t, i18n } = useTranslation("workspace-home");
   const {
     analyticsData: data,
     analyticsLoading: loading,
@@ -399,7 +400,7 @@ export function OrganizationAnalytics({ organizationId }: OrganizationAnalyticsP
         return (
           <Card className="p-4 h-full flex items-center justify-center">
             <div className="text-center text-muted-foreground">
-              <p>{t("analytics.failed_to_load_widget_data", { widgetTitle: widget.title })}</p>
+              <p>{t("analytics.failed_to_load_widget_data", { widgetTitle: t(widget.title) })}</p>
               <Button variant="outline" size="sm" onClick={handleFetchData} className="mt-2">
                 {t("analytics.retry_button")}
               </Button>
@@ -438,13 +439,13 @@ export function OrganizationAnalytics({ organizationId }: OrganizationAnalyticsP
   );
 
   const getCurrentDate = useCallback(() => {
-    return formatDateForDisplay(new Date(), {
+    return new Intl.DateTimeFormat(i18n.language, {
       weekday: "long",
       year: "numeric",
       month: "long",
       day: "numeric",
-    });
-  }, []);
+    }).format(new Date());
+  }, [i18n.language]);
 
   // Early returns after all hooks
   if (loading) {
@@ -522,36 +523,38 @@ export function OrganizationAnalytics({ organizationId }: OrganizationAnalyticsP
 
       {/* Widgets Grid */}
       {data && visibleCount > 0 && (
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCenter}
-          onDragStart={handleDragStart}
-          onDragEnd={handleDragEnd}
-        >
-          <SortableContext
-            items={visibleWidgets.map((w) => w.id)}
-            strategy={rectSortingStrategy}
+        <div style={{ willChange: "width" }}>
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
           >
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {visibleWidgets.map((widget) => (
-                <SortableWidget key={widget.id} id={widget.id} className={widget.gridCols}>
-                  {renderWidgetContent(widget)}
-                </SortableWidget>
-              ))}
-            </div>
-          </SortableContext>
-          <DragOverlay>
-            {activeWidget ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full">
-                <div className={activeWidget.gridCols}>
-                  <Card className="h-full opacity-80 shadow-xl cursor-grabbing">
-                    {renderWidgetContent(activeWidget)}
-                  </Card>
-                </div>
+            <SortableContext
+              items={visibleWidgets.map((w) => w.id)}
+              strategy={rectSortingStrategy}
+            >
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {visibleWidgets.map((widget) => (
+                  <SortableWidget key={widget.id} id={widget.id} className={widget.gridCols}>
+                    {renderWidgetContent(widget)}
+                  </SortableWidget>
+                ))}
               </div>
-            ) : null}
-          </DragOverlay>
-        </DndContext>
+            </SortableContext>
+            <DragOverlay>
+              {activeWidget ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full">
+                  <div className={activeWidget.gridCols}>
+                    <Card className="h-full opacity-80 shadow-xl cursor-grabbing">
+                      {renderWidgetContent(activeWidget)}
+                    </Card>
+                  </div>
+                </div>
+              ) : null}
+            </DragOverlay>
+          </DndContext>
+        </div>
       )}
     </div>
   );

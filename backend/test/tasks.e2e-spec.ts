@@ -21,6 +21,7 @@ describe('TasksController (e2e)', () => {
   let projectSlug: string;
   let statusId: string;
   let taskId: string;
+  let taskSlug: string;
   let sprintId: string;
   let parentTaskId: string;
 
@@ -172,24 +173,10 @@ describe('TasksController (e2e)', () => {
         projectId: projectId,
         statusId: statusId,
         taskNumber: 1,
-        slug: 'TASK-PR',
+        slug: `${project.slug}-PR`,
       },
     });
     parentTaskId = parentTask.id;
-  });
-
-  afterAll(async () => {
-    if (prismaService) {
-      // Cleanup
-      await prismaService.task.deleteMany({ where: { projectId } });
-      await prismaService.sprint.deleteMany({ where: { projectId } });
-      await prismaService.taskStatus.deleteMany({ where: { workflow: { organizationId } } });
-      await prismaService.project.deleteMany({ where: { id: projectId } });
-      await prismaService.workspace.deleteMany({ where: { id: workspaceId } });
-      await prismaService.organization.deleteMany({ where: { id: organizationId } });
-      await prismaService.user.deleteMany({ where: { id: { in: [user.id, user2.id] } } });
-    }
-    await app.close();
   });
 
   describe('/tasks (POST)', () => {
@@ -212,6 +199,7 @@ describe('TasksController (e2e)', () => {
           expect(res.body).toHaveProperty('id');
           expect(res.body.title).toBe(createDto.title);
           taskId = res.body.id;
+          taskSlug = res.body.slug;
         });
     });
 
@@ -245,6 +233,29 @@ describe('TasksController (e2e)', () => {
           expect(res.body.parentTaskId).toBe(parentTaskId);
           expect(res.body.storyPoints).toBe(5);
           expect(res.body.assignees.length).toBe(2);
+        });
+    });
+
+    it('should create a task with parentTaskId as a slug', async () => {
+      const parentTask = await prismaService.task.findUnique({
+        where: { id: parentTaskId },
+        select: { slug: true },
+      });
+
+      const createDto: CreateTaskDto = {
+        title: 'Subtask by Slug',
+        projectId: projectId,
+        statusId: statusId,
+        parentTaskId: parentTask!.slug,
+      };
+
+      return request(app.getHttpServer())
+        .post('/api/tasks')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send(createDto)
+        .expect(HttpStatus.CREATED)
+        .expect((res) => {
+          expect(res.body.parentTaskId).toBe(parentTaskId);
         });
     });
 
@@ -467,6 +478,24 @@ describe('TasksController (e2e)', () => {
         });
     });
 
+    it('should filter tasks by parentTaskId using slug', async () => {
+      const parentTask = await prismaService.task.findUnique({
+        where: { id: parentTaskId },
+        select: { slug: true },
+      });
+
+      return request(app.getHttpServer())
+        .get('/api/tasks')
+        .query({ organizationId, parentTaskId: parentTask!.slug })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          const allAreSubtasks = res.body.data.every((t: any) => t.parentTaskId === parentTaskId);
+          expect(allAreSubtasks).toBe(true);
+          expect(res.body.data.length).toBeGreaterThanOrEqual(1);
+        });
+    });
+
     it('should filter tasks by parentTaskId=null', () => {
       return request(app.getHttpServer())
         .get('/api/tasks')
@@ -491,6 +520,67 @@ describe('TasksController (e2e)', () => {
           expect(res.body.limit).toBe(1);
         });
     });
+
+    it('should test grouping (groupBy)', () => {
+      return request(app.getHttpServer())
+        .get('/api/tasks')
+        .query({ organizationId, groupBy: 'priority' })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body).toHaveProperty('data');
+          expect(Array.isArray(res.body.data)).toBe(true);
+          expect(res.body.data.length).toBeGreaterThanOrEqual(1);
+        });
+    });
+
+    it('should test grouping by status (groupBy=status)', () => {
+      return request(app.getHttpServer())
+        .get('/api/tasks')
+        .query({ organizationId, groupBy: 'status' })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body).toHaveProperty('data');
+          expect(Array.isArray(res.body.data)).toBe(true);
+          expect(res.body.data.length).toBeGreaterThanOrEqual(1);
+        });
+    });
+
+    it('should test grouping page boundaries and prevent group splits (groupBy=status)', async () => {
+      const statusRes = await request(app.getHttpServer())
+        .get('/api/tasks')
+        .query({ organizationId, groupBy: 'status' })
+        .set('Authorization', `Bearer ${accessToken}`);
+
+      const tasks = statusRes.body.data;
+      if (tasks.length >= 2) {
+        const res = await request(app.getHttpServer())
+          .get('/api/tasks')
+          .query({ organizationId, groupBy: 'status', limit: 1 })
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.OK);
+
+        expect(res.body).toHaveProperty('data');
+        expect(Array.isArray(res.body.data)).toBe(true);
+
+        const page1Tasks = res.body.data;
+        const page2Res = await request(app.getHttpServer())
+          .get('/api/tasks')
+          .query({ organizationId, groupBy: 'status', limit: 1, page: 2 })
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.OK);
+
+        const page2Tasks = page2Res.body.data;
+
+        const page1StatusIds = new Set(page1Tasks.map((t: any) => t.statusId));
+        const page2StatusIds = new Set(page2Tasks.map((t: any) => t.statusId));
+
+        for (const statusId of page1StatusIds) {
+          expect(page2StatusIds.has(statusId)).toBe(false);
+        }
+      }
+    });
   });
 
   describe('/tasks/all-tasks (GET)', () => {
@@ -504,6 +594,56 @@ describe('TasksController (e2e)', () => {
           expect(res.body).toHaveProperty('data');
           expect(Array.isArray(res.body.data)).toBe(true);
           expect(res.body.data.length).toBeGreaterThanOrEqual(2);
+        });
+    });
+
+    it('should fetch tasks for GANTT view including subtasks and honoring sprintId', async () => {
+      // Create a test task and subtask in the sprint
+      const ganttTask = await prismaService.task.create({
+        data: {
+          title: 'Gantt Test Task',
+          projectId,
+          statusId,
+          sprintId,
+          taskNumber: 8000,
+          slug: `${projectSlug}-8000`,
+        },
+      });
+
+      await prismaService.task.create({
+        data: {
+          title: 'Gantt Test Subtask',
+          projectId,
+          statusId,
+          sprintId,
+          parentTaskId: ganttTask.id,
+          taskNumber: 8001,
+          slug: `${projectSlug}-8001`,
+        },
+      });
+
+      return request(app.getHttpServer())
+        .get('/api/tasks/all-tasks')
+        .query({
+          organizationId,
+          viewType: 'GANTT',
+          parentTaskId: 'all',
+          sprintId: sprintId,
+          sortBy: 'listRank',
+          sortOrder: 'asc'
+        })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body).toHaveProperty('data');
+          expect(Array.isArray(res.body.data)).toBe(true);
+          // Should include both the main task and the subtask
+          const taskIds = res.body.data.map((t: any) => t.id);
+          expect(taskIds.includes(ganttTask.id)).toBe(true);
+          
+          // Verify sprintId is honored (all returned tasks should belong to the sprint)
+          const allMatchSprint = res.body.data.every((t: any) => !t.sprintId || t.sprintId === sprintId);
+          expect(allMatchSprint).toBe(true);
         });
     });
   });
@@ -524,6 +664,108 @@ describe('TasksController (e2e)', () => {
           expect(res.body.meta).toHaveProperty('totalStatuses');
           expect(res.body.meta).toHaveProperty('fetchedAt');
         });
+    });
+  });
+
+  describe('/tasks/grouped (GET)', () => {
+    it('should get tasks grouped by status (initial load)', () => {
+      return request(app.getHttpServer())
+        .get('/api/tasks/grouped')
+        .query({ organizationId, groupBy: 'status' })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body).toHaveProperty('groups');
+          expect(Array.isArray(res.body.groups)).toBe(true);
+          expect(res.body).toHaveProperty('groupBy');
+          expect(res.body.groupBy).toBe('status');
+
+          if (res.body.groups.length > 0) {
+            const group = res.body.groups[0];
+            expect(group).toHaveProperty('key');
+            expect(group).toHaveProperty('label');
+            expect(group).toHaveProperty('totalCount');
+            expect(group).toHaveProperty('tasks');
+            expect(Array.isArray(group.tasks)).toBe(true);
+          }
+        });
+    });
+
+    it('should get tasks grouped by priority (initial load)', () => {
+      return request(app.getHttpServer())
+        .get('/api/tasks/grouped')
+        .query({ organizationId, groupBy: 'priority' })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body.groupBy).toBe('priority');
+          expect(Array.isArray(res.body.groups)).toBe(true);
+        });
+    });
+
+    it('should support load-more mode for a specific group key', async () => {
+      // 1. First request to get all groups and find a key
+      const initialRes = await request(app.getHttpServer())
+        .get('/api/tasks/grouped')
+        .query({ organizationId, groupBy: 'status' })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      if (initialRes.body.groups.length > 0) {
+        const targetGroupKey = initialRes.body.groups[0].key;
+
+        // 2. Request details for that group key in load-more mode
+        await request(app.getHttpServer())
+          .get('/api/tasks/grouped')
+          .query({
+            organizationId,
+            groupBy: 'status',
+            groupKey: targetGroupKey,
+            page: 1,
+            limitPerGroup: 2,
+          })
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.OK)
+          .expect((res) => {
+            expect(res.body).toHaveProperty('groups');
+            expect(res.body.groups.length).toBe(1);
+            expect(res.body.groups[0].key).toBe(targetGroupKey);
+            expect(res.body.groups[0]).toHaveProperty('page');
+            expect(res.body.groups[0].page).toBe(1);
+          });
+      }
+    });
+
+    it('should apply filters (e.g. projectId) correctly', async () => {
+      await request(app.getHttpServer())
+        .get('/api/tasks/grouped')
+        .query({ organizationId, groupBy: 'status', projectId })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body.groupBy).toBe('status');
+          for (const group of res.body.groups) {
+            for (const task of group.tasks) {
+              expect(task.projectId).toBe(projectId);
+            }
+          }
+        });
+    });
+
+    it('should fail if organizationId is missing', () => {
+      return request(app.getHttpServer())
+        .get('/api/tasks/grouped')
+        .query({ groupBy: 'status' })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+    });
+
+    it('should fail if groupBy is missing or invalid', () => {
+      return request(app.getHttpServer())
+        .get('/api/tasks/grouped')
+        .query({ organizationId, groupBy: 'invalid_field' })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.BAD_REQUEST);
     });
   });
 
@@ -574,7 +816,7 @@ describe('TasksController (e2e)', () => {
   });
 
   describe('/tasks/:id (GET)', () => {
-    it('should get a task', () => {
+    it('should get a task by UUID', () => {
       return request(app.getHttpServer())
         .get(`/api/tasks/${taskId}`)
         .set('Authorization', `Bearer ${accessToken}`)
@@ -584,10 +826,21 @@ describe('TasksController (e2e)', () => {
           expect(res.body.title).toBe('E2E Task');
         });
     });
+
+    it('should get a task by slug', () => {
+      return request(app.getHttpServer())
+        .get(`/api/tasks/${taskSlug}`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body.id).toBe(taskId);
+          expect(res.body.slug).toBe(taskSlug);
+        });
+    });
   });
 
   describe('/tasks/:id (PATCH)', () => {
-    it('should update a task', () => {
+    it('should update a task by UUID', () => {
       const updateDto = { title: 'Updated E2E Task' };
       return request(app.getHttpServer())
         .patch(`/api/tasks/${taskId}`)
@@ -598,12 +851,47 @@ describe('TasksController (e2e)', () => {
           expect(res.body.title).toBe(updateDto.title);
         });
     });
+    it('should update a task using its slug in the URL', () => {
+      const updateDto = { title: 'Updated E2E Task by Slug' };
+      return request(app.getHttpServer())
+        .patch(`/api/tasks/${taskSlug}`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send(updateDto)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body.title).toBe(updateDto.title);
+        });
+    });
+
+    it('should update a task parentTaskId using a slug', async () => {
+      // Create another task to be the new parent
+      const newParentTask = await prismaService.task.create({
+        data: {
+          title: 'New Parent Task',
+          projectId,
+          statusId,
+          taskNumber: 20,
+          slug: `${projectSlug}-20`,
+          createdBy: user.id,
+        },
+      });
+
+      const updateDto = { parentTaskId: newParentTask.slug };
+      return request(app.getHttpServer())
+        .patch(`/api/tasks/${taskId}`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send(updateDto)
+        .expect(HttpStatus.OK)
+        .expect((res) => {
+          expect(res.body.parentTaskId).toBe(newParentTask.id);
+        });
+    });
   });
 
   describe('/tasks/:id/status (PATCH)', () => {
-    it('should update task status', () => {
+    it('should update task status by slug', () => {
       return request(app.getHttpServer())
-        .patch(`/api/tasks/${taskId}/status`)
+        .patch(`/api/tasks/${taskSlug}/status`)
         .set('Authorization', `Bearer ${accessToken}`)
         .send({ statusId })
         .expect(HttpStatus.OK)
@@ -614,9 +902,9 @@ describe('TasksController (e2e)', () => {
   });
 
   describe('/tasks/:id/assignees (PATCH)', () => {
-    it('should update task assignees', () => {
+    it('should update task assignees by slug', () => {
       return request(app.getHttpServer())
-        .patch(`/api/tasks/${taskId}/assignees`)
+        .patch(`/api/tasks/${taskSlug}/assignees`)
         .set('Authorization', `Bearer ${accessToken}`)
         .send({ assigneeIds: [user.id] })
         .expect(HttpStatus.OK)
@@ -636,9 +924,9 @@ describe('TasksController (e2e)', () => {
   });
 
   describe('/tasks/:id/unassign (PATCH)', () => {
-    it('should unassign all users from a task', () => {
+    it('should unassign all users from a task by slug', () => {
       return request(app.getHttpServer())
-        .patch(`/api/tasks/${taskId}/unassign`)
+        .patch(`/api/tasks/${taskSlug}/unassign`)
         .set('Authorization', `Bearer ${accessToken}`)
         .expect(HttpStatus.OK)
         .expect((res) => {
@@ -648,9 +936,9 @@ describe('TasksController (e2e)', () => {
   });
 
   describe('/tasks/:id/priority (PATCH)', () => {
-    it('should update task priority', () => {
+    it('should update task priority by slug', () => {
       return request(app.getHttpServer())
-        .patch(`/api/tasks/${taskId}/priority`)
+        .patch(`/api/tasks/${taskSlug}/priority`)
         .set('Authorization', `Bearer ${accessToken}`)
         .send({ priority: 'LOW' })
         .expect(HttpStatus.OK)
@@ -661,10 +949,10 @@ describe('TasksController (e2e)', () => {
   });
 
   describe('/tasks/:id/due-date (PATCH)', () => {
-    it("should update task's due date", () => {
+    it("should update task's due date by slug", () => {
       const dueDate = new Date().toISOString();
       return request(app.getHttpServer())
-        .patch(`/api/tasks/${taskId}/due-date`)
+        .patch(`/api/tasks/${taskSlug}/due-date`)
         .set('Authorization', `Bearer ${accessToken}`)
         .send({ dueDate })
         .expect(HttpStatus.OK)
@@ -675,9 +963,9 @@ describe('TasksController (e2e)', () => {
   });
 
   describe('/tasks/:id/comments (POST)', () => {
-    it('should add a comment to a task', () => {
+    it('should add a comment to a task by slug', () => {
       return request(app.getHttpServer())
-        .post(`/api/tasks/${taskId}/comments`)
+        .post(`/api/tasks/${taskSlug}/comments`)
         .set('Authorization', `Bearer ${accessToken}`)
         .send({ comment: 'Test Shortcut Comment' })
         .expect(HttpStatus.CREATED)
@@ -689,11 +977,29 @@ describe('TasksController (e2e)', () => {
   });
 
   describe('/tasks/:id (DELETE)', () => {
-    it('should delete a task', async () => {
+    it('should delete a task by slug', async () => {
       // Create a task specifically for deletion
       const taskToDelete = await prismaService.task.create({
         data: {
-          title: 'Task to Delete',
+          title: 'Task to Delete by Slug',
+          projectId,
+          statusId,
+          taskNumber: 1000,
+          slug: `${projectSlug}-1000`,
+        },
+      });
+
+      return request(app.getHttpServer())
+        .delete(`/api/tasks/${taskToDelete.slug}`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+    });
+
+    it('should delete a task by UUID', async () => {
+      // Create a task specifically for deletion
+      const taskToDelete = await prismaService.task.create({
+        data: {
+          title: 'Task to Delete by UUID',
           projectId,
           statusId,
           taskNumber: 999,
@@ -1201,5 +1507,19 @@ describe('TasksController (e2e)', () => {
           expect(res.body.isRecurring).toBe(false);
         });
     });
+  });
+
+  afterAll(async () => {
+    if (prismaService) {
+      // Cleanup
+      await prismaService.task.deleteMany({ where: { projectId } });
+      await prismaService.sprint.deleteMany({ where: { projectId } });
+      await prismaService.taskStatus.deleteMany({ where: { workflow: { organizationId } } });
+      await prismaService.project.deleteMany({ where: { id: projectId } });
+      await prismaService.workspace.deleteMany({ where: { id: workspaceId } });
+      await prismaService.organization.deleteMany({ where: { id: organizationId } });
+      await prismaService.user.deleteMany({ where: { id: { in: [user.id, user2.id] } } });
+    }
+    await app.close();
   });
 });

@@ -9,6 +9,7 @@ import {
   CreateTaskCommentRequest,
   CreateTaskRequest,
   GetTasksParams,
+  GroupedTasksApiResponse,
   PaginatedTaskResponse,
   Task,
   TaskAttachment,
@@ -216,6 +217,7 @@ export const taskApi = {
       sortOrder?: string;
       page?: number;
       limit?: number;
+      groupBy?: string;
     }
   ): Promise<PaginatedTaskResponse> => {
     try {
@@ -238,6 +240,7 @@ export const taskApi = {
       if (params?.reporters) queryParams.append("reporterIds", params.reporters);
       if (params?.sortBy) queryParams.append("sortBy", params.sortBy);
       if (params?.sortOrder) queryParams.append("sortOrder", params.sortOrder);
+      if (params?.groupBy && params.groupBy !== "none") queryParams.append("groupBy", params.groupBy);
 
       // Pagination
       if (params?.page !== undefined) queryParams.append("page", String(params.page));
@@ -269,6 +272,10 @@ export const taskApi = {
       viewType?: 'LIST' | 'BOARD' | 'GANTT';
       page?: number;
       limit?: number;
+      from?: string;
+      to?: string;
+      dateField?: string;
+      groupBy?: string;
     }
   ): Promise<PaginatedTaskResponse> => {
     try {
@@ -281,6 +288,10 @@ export const taskApi = {
       if (params?.workspaceId) queryParams.append("workspaceId", params.workspaceId);
       if (params?.projectId) queryParams.append("projectId", params.projectId);
       if (params?.sprintId) queryParams.append("sprintId", params.sprintId);
+
+      if (params?.from) queryParams.append("from", params.from);
+      if (params?.to) queryParams.append("to", params.to);
+      if (params?.dateField) queryParams.append("dateField", params.dateField);
 
       if (params?.includeSubtasks) {
         queryParams.append("parentTaskId", "all");
@@ -296,6 +307,7 @@ export const taskApi = {
       if (params?.sortBy) queryParams.append("sortBy", params.sortBy);
       if (params?.sortOrder) queryParams.append("sortOrder", params.sortOrder);
       if (params?.viewType) queryParams.append("viewType", params.viewType);
+      if (params?.groupBy) queryParams.append("groupBy", params.groupBy);
 
       // Pagination
       if (params?.page !== undefined) queryParams.append("page", String(params.page));
@@ -311,6 +323,56 @@ export const taskApi = {
       throw error;
     }
   },
+
+  getGroupedTasks: async (
+    organizationId: string,
+    groupBy: string,
+    params?: {
+      workspaceId?: string;
+      projectId?: string;
+      sprintId?: string;
+      priorities?: string;
+      statuses?: string;
+      types?: string;
+      assigneeIds?: string;
+      reporterIds?: string;
+      search?: string;
+      limitPerGroup?: number;
+      /** Load-more mode: key of the group to paginate */
+      groupKey?: string;
+      /** Page within the specified group (1-based) */
+      page?: number;
+    }
+  ): Promise<GroupedTasksApiResponse> => {
+    try {
+      const queryParams = new URLSearchParams();
+      queryParams.append("organizationId", encodeURIComponent(organizationId));
+      queryParams.append("groupBy", groupBy);
+
+      if (params?.workspaceId) queryParams.append("workspaceId", encodeURIComponent(params.workspaceId));
+      if (params?.projectId)   queryParams.append("projectId", encodeURIComponent(params.projectId));
+      if (params?.sprintId)    queryParams.append("sprintId", encodeURIComponent(params.sprintId));
+      if (params?.priorities)  queryParams.append("priorities", params.priorities);
+      if (params?.statuses)    queryParams.append("statuses", params.statuses);
+      if (params?.types)       queryParams.append("types", params.types);
+      if (params?.assigneeIds) queryParams.append("assigneeIds", params.assigneeIds);
+      if (params?.reporterIds) queryParams.append("reporterIds", params.reporterIds);
+      if (params?.search)      queryParams.append("search", params.search);
+      if (params?.limitPerGroup !== undefined)
+        queryParams.append("limitPerGroup", String(params.limitPerGroup));
+      if (params?.groupKey)    queryParams.append("groupKey", params.groupKey);
+      if (params?.page !== undefined)
+        queryParams.append("page", String(params.page));
+
+      const url = `/tasks/grouped?${queryParams.toString()}`;
+      const response = await api.get<GroupedTasksApiResponse>(url);
+      return response.data;
+    } catch (error) {
+      console.error("Get grouped tasks error:", error);
+      throw error;
+    }
+  },
+
 
   getPublicCalendarTask: async (
     workspaceSlug: string,
@@ -361,6 +423,7 @@ export const taskApi = {
       status?: string;
       priority?: string;
       type?: string;
+      parentTaskId?: string;
     }
   ): Promise<PaginatedTaskResponse> => {
     try {
@@ -375,6 +438,7 @@ export const taskApi = {
       if (filters?.status) params.append("status", filters.status);
       if (filters?.priority) params.append("priority", filters.priority);
       if (filters?.type) params.append("type", filters.type);
+      if (filters?.parentTaskId) params.append("parentTaskId", filters.parentTaskId);
 
       // Sanitize slugs to prevent SSRF
       const safeWorkspaceSlug = sanitizeSlug(workspaceSlug);
@@ -521,9 +585,6 @@ export const taskApi = {
 
   getTaskById: async (taskId: string, isAuth: boolean): Promise<Task> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
-      }
       let response;
       if (isAuth) {
         response = await api.get<Task>(`/tasks/${encodeURIComponent(taskId)}`);
@@ -544,9 +605,9 @@ export const taskApi = {
       }
       let response;
       if (isAuth) {
-        response = await api.get<Task>(`/tasks/key/${encodeURIComponent(slug)}`);
+        response = await api.get<Task>(`/tasks/slug/${encodeURIComponent(slug)}`);
       } else {
-        response = await api.get<Task>(`/public/project-tasks/key/${encodeURIComponent(slug)}`);
+        response = await api.get<Task>(`/public/project-tasks/slug/${encodeURIComponent(slug)}`);
       }
       return response.data;
     } catch (error) {
@@ -557,9 +618,6 @@ export const taskApi = {
 
   updateTask: async (taskId: string, taskData: UpdateTaskRequest): Promise<Task> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
-      }
       const response = await api.patch<Task>(`/tasks/${encodeURIComponent(taskId)}`, taskData);
       return response.data;
     } catch (error) {
@@ -599,9 +657,6 @@ export const taskApi = {
     }
   ): Promise<void> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
-      }
       await api.patch(`/task-ranks/${encodeURIComponent(taskId)}/reorder`, reorderData);
     } catch (error) {
       console.error("Update relative task rank error:", error);
@@ -611,9 +666,6 @@ export const taskApi = {
 
   deleteTask: async (taskId: string): Promise<void> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
-      }
       await api.delete(`/tasks/${encodeURIComponent(taskId)}`);
     } catch (error) {
       console.error("Delete task error:", error);
@@ -624,8 +676,8 @@ export const taskApi = {
   // Recurring Task operations
   completeOccurrence: async (taskId: string): Promise<{ completedTask: Task; nextTask: Task }> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (!taskId || typeof taskId !== 'string') {
+        throw new Error('Invalid task identifier');
       }
       const response = await api.post<{ completedTask: Task; nextTask: Task }>(
         `/tasks/${encodeURIComponent(taskId)}/complete-occurrence`
@@ -639,8 +691,8 @@ export const taskApi = {
 
   addRecurrence: async (taskId: string, recurrenceConfig: any): Promise<Task> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (!taskId || typeof taskId !== 'string') {
+        throw new Error('Invalid task identifier');
       }
       const response = await api.post<Task>(
         `/tasks/${encodeURIComponent(taskId)}/recurrence`,
@@ -655,8 +707,8 @@ export const taskApi = {
 
   updateRecurrence: async (taskId: string, recurrenceConfig: any): Promise<Task> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (!taskId || typeof taskId !== 'string') {
+        throw new Error('Invalid task identifier');
       }
       const response = await api.patch<Task>(
         `/tasks/${encodeURIComponent(taskId)}/recurrence`,
@@ -671,8 +723,8 @@ export const taskApi = {
 
   stopRecurrence: async (taskId: string): Promise<Task> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (!taskId || typeof taskId !== 'string') {
+        throw new Error('Invalid task identifier');
       }
       const response = await api.delete<Task>(
         `/tasks/${encodeURIComponent(taskId)}/recurrence`
@@ -712,8 +764,8 @@ export const taskApi = {
     limit: number = 10
   ): Promise<any> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (!taskId || typeof taskId !== 'string') {
+        throw new Error('Invalid task identifier');
       }
       let response;
       if (isAuth) {
@@ -777,8 +829,8 @@ export const taskApi = {
     loadedCount?: number;
   }> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (!taskId || typeof taskId !== 'string') {
+        throw new Error('Invalid task identifier');
       }
 
       const page = options?.page ?? 1;
@@ -863,8 +915,8 @@ export const taskApi = {
 
   // Task Attachment operations
   uploadAttachment: async (taskId: string, file: File): Promise<TaskAttachment> => {
-    if (!isValidUUID(taskId)) {
-      throw new Error("Invalid taskId format. Expected a UUID.");
+    if (!taskId || typeof taskId !== 'string') {
+      throw new Error("Invalid task identifier");
     }
     try {
       const formData = new FormData();
@@ -894,9 +946,8 @@ export const taskApi = {
   },
 
   getTaskAttachments: async (taskId: string, isAuth: boolean): Promise<TaskAttachment[]> => {
-    // Validate that taskId is a UUID before using in any endpoint
-    if (!isValidUUID(taskId)) {
-      throw new Error("Invalid taskId format");
+    if (!taskId || typeof taskId !== 'string') {
+      throw new Error("Invalid task identifier");
     }
     try {
       let response;
@@ -978,8 +1029,8 @@ export const taskApi = {
 
   getAttachmentStats: async (taskId?: string): Promise<AttachmentStats> => {
     try {
-      if (taskId && !isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (taskId && (typeof taskId !== 'string' || !taskId)) {
+        throw new Error('Invalid task identifier');
       }
       const query = taskId ? `?taskId=${encodeURIComponent(taskId)}` : "";
       const response = await api.get<AttachmentStats>(`/task-attachments/stats${query}`);
@@ -1087,7 +1138,7 @@ export const taskApi = {
 
   removeLabelFromTask: async (taskId: string, labelId: string): Promise<void> => {
     try {
-      if (!isValidUUID(taskId) || !isValidUUID(labelId)) {
+      if (!taskId || typeof taskId !== 'string' || !isValidUUID(labelId)) {
         throw new Error("Invalid taskId or labelId");
       }
       await api.delete(`/task-labels/${encodeURIComponent(taskId)}/${encodeURIComponent(labelId)}`);
@@ -1099,8 +1150,8 @@ export const taskApi = {
 
   getTaskLabels: async (taskId: string): Promise<TaskLabel[]> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
+      if (!taskId || typeof taskId !== 'string') {
+        throw new Error('Invalid task identifier');
       }
       const response = await api.get<TaskLabel[]>(`/task-labels?taskId=${encodeURIComponent(taskId)}`);
       return response.data;
@@ -1200,9 +1251,6 @@ export const taskApi = {
 
   updateTaskStatus: async (taskId: string, statusId: string): Promise<Task> => {
     try {
-      if (!isValidUUID(taskId)) {
-        throw new Error('Invalid task ID format');
-      }
       if (!isValidUUID(statusId)) {
         throw new Error('Invalid status ID format');
       }
@@ -1287,18 +1335,12 @@ export const taskApi = {
 
   // Validate and format UUID using strict v4 check
   assignTaskAssignees: async (taskId: string, assigneeIds: string[]) => {
-    if (!isValidUUID(taskId)) {
-      throw new Error("Invalid taskId provided. Must be a valid v4 UUID.");
+    if (!taskId || typeof taskId !== 'string') {
+      throw new Error("Invalid task identifier");
     }
 
-    // Always use canonical hyphenated UUID form for safety
-    const safeTaskId = taskId.includes("-") ? taskId : [
-      taskId.slice(0, 8),
-      taskId.slice(8, 12),
-      taskId.slice(12, 16),
-      taskId.slice(16, 20),
-      taskId.slice(20, 32),
-    ].join("-");
+    // Use task identifier as is (internal resolution handles UUID or Slug)
+    const safeTaskId = taskId;
 
     try {
       const response = await api.patch(`/tasks/${encodeURIComponent(safeTaskId)}/assignees`, {
@@ -1367,6 +1409,40 @@ export const taskApi = {
       return response.data;
     } catch (error: any) {
       console.error("Bulk update task status error:", error?.response || error);
+      throw error;
+    }
+  },
+
+  bulkAssignTasks: async (params: {
+    taskIds?: string[];
+    projectId?: string;
+    all?: boolean;
+    excludedIds?: string[];
+    assigneeIds: string[];
+    search?: string;
+    statuses?: string;
+    priorities?: string;
+    types?: string;
+    assignees?: string;
+    reporters?: string;
+    sprintId?: string;
+    organizationId?: string;
+    workspaceId?: string;
+  }): Promise<{
+    assignedCount: number;
+    updatedTasks: Task[];
+    failedTasks: Array<{ id: string; reason: string }>;
+  }> => {
+    try {
+      const response = await api.post<{
+        assignedCount: number;
+        updatedTasks: Task[];
+        failedTasks: Array<{ id: string; reason: string }>;
+      }>("/tasks/bulk-assign", params);
+
+      return response.data;
+    } catch (error: any) {
+      console.error("Bulk assign tasks error:", error?.response || error);
       throw error;
     }
   },

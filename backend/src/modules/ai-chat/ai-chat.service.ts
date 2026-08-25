@@ -1,4 +1,14 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
+import { randomBytes } from 'crypto';
+import axios from 'axios';
+import type { Agent as HttpAgent } from 'http';
+import type { Agent as HttpsAgent } from 'https';
+import {
+  parseHostAllowlist,
+  resolveSafeDestination,
+  UnsafeDestinationError,
+  type SafeDestination,
+} from '../../common/safe-outbound-http';
 import {
   ChatRequestDto,
   ChatResponseDto,
@@ -7,14 +17,57 @@ import {
   TestConnectionResponseDto,
   GenerateDescriptionDto,
   GenerateDescriptionResponseDto,
+  CreateConversationDto,
+  RenameConversationDto,
+  UpdateMessagesDto,
 } from './dto/chat.dto';
 import { SettingsService } from '../settings/settings.service';
 import { enhancePromptWithContext } from './app-guide';
 import { getAutomationPrompt } from './automation-prompts';
+import { PrismaService } from '../../prisma/prisma.service';
+import { Conversation } from '@prisma/client';
+
+/**
+ * Drop empty messages and merge consecutive same-role ones.
+ *
+ * The browser agent appends action results as extra `user` turns, so history arrives as
+ * assistant -> user -> user. OpenAI tolerates that; Cohere rejects it with
+ * "No valid response generated. Try updating messages" and Anthropic requires strict
+ * alternation. Normalising here keeps every provider happy.
+ */
+export function normalizeMessages(messages: ChatMessageDto[]): ChatMessageDto[] {
+  const out: ChatMessageDto[] = [];
+
+  for (const msg of messages) {
+    if (!msg?.content || !msg.content.trim()) continue;
+
+    const prev = out[out.length - 1];
+    if (prev && prev.role === msg.role) {
+      prev.content = `${prev.content}\n\n${msg.content}`;
+    } else {
+      out.push({ role: msg.role, content: msg.content });
+    }
+  }
+
+  return out;
+}
+
+/** The parts of a fetch Response the provider calls actually read. */
+interface ResponseLike {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+  json(): Promise<any>;
+}
 
 @Injectable()
 export class AiChatService {
-  constructor(private settingsService: SettingsService) {}
+  private readonly logger = new Logger(AiChatService.name);
+
+  constructor(
+    private settingsService: SettingsService,
+    private prisma: PrismaService,
+  ) {}
 
   /**
    * Detect the API vendor/family from the model string so we can apply
@@ -83,11 +136,277 @@ export class AiChatService {
         hostname.endsWith('.generativelanguage.googleapis.com')
       )
         return 'google';
+      if (hostname === 'api.cohere.com' || hostname.endsWith('.api.cohere.com')) return 'cohere';
     } catch (e) {
       console.log(e);
       // Invalid URL, fall back to previous logic or return custom (could alternatively throw error)
     }
     return 'custom'; // fallback for unknown providers
+  }
+
+  // Callers handle their own error style (throw vs return-object) and can tweak
+  // the returned body (e.g. Anthropic extracts system messages).
+  private buildProviderRequest(opts: {
+    provider: string;
+    apiUrl: string;
+    apiKey: string;
+    model: string;
+    messages: ChatMessageDto[];
+    maxTokens: number;
+    temperature: number;
+    samplingExtras?: boolean; // top_p / penalties — only chat path needs these
+  }): { url: string; headers: Record<string, string>; body: any } {
+    const { provider, apiUrl, apiKey, model, messages, maxTokens, temperature, samplingExtras } =
+      opts;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    };
+
+    let body: any = {
+      model,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+      stream: false,
+    };
+
+    let url = apiUrl;
+    const isGpt5Model = typeof model === 'string' && model.startsWith('gpt-5');
+
+    switch (provider) {
+      case 'openrouter':
+        url = `${apiUrl}/chat/completions`;
+        headers['HTTP-Referer'] = process.env.APP_URL || 'http://localhost:3000';
+        headers['X-Title'] = 'Taskosaur AI Assistant';
+        if (samplingExtras) {
+          body.top_p = 0.9;
+          body.frequency_penalty = 0;
+          body.presence_penalty = 0;
+        }
+        break;
+
+      case 'openai':
+        url = `${apiUrl}/chat/completions`;
+        delete body.max_tokens;
+        body.max_completion_tokens = maxTokens;
+        if (isGpt5Model) {
+          delete body.temperature;
+        } else if (samplingExtras) {
+          body.top_p = 0.9;
+          body.frequency_penalty = 0;
+          body.presence_penalty = 0;
+        }
+        break;
+
+      case 'ollama':
+        if (apiUrl.includes('/v1')) {
+          url = apiUrl.endsWith('/chat/completions') ? apiUrl : `${apiUrl}/chat/completions`;
+        } else if (apiUrl.includes('/api')) {
+          url = apiUrl.endsWith('/chat') ? apiUrl : `${apiUrl}/chat`;
+        } else {
+          url = `${apiUrl}/v1/chat/completions`;
+        }
+        delete headers['Authorization'];
+        if (samplingExtras) body.top_p = 0.9;
+        break;
+
+      case 'anthropic':
+        url = `${apiUrl}/messages`;
+        headers['x-api-key'] = apiKey;
+        headers['anthropic-version'] = '2023-06-01';
+        delete headers['Authorization'];
+        body = {
+          model,
+          messages: messages.filter((m) => m.role !== 'system'),
+          system: messages.find((m) => m.role === 'system')?.content,
+          max_tokens: maxTokens,
+          temperature,
+        };
+        break;
+
+      case 'google':
+        this.validateModelName(model);
+        url = `${apiUrl}/models/${encodeURIComponent(String(model))}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        delete headers['Authorization'];
+        body = {
+          contents: messages.map((m) => ({
+            role: m.role === 'assistant' ? 'model' : m.role === 'system' ? 'model' : m.role,
+            parts: [{ text: m.content }],
+          })),
+          generationConfig: { temperature, maxOutputTokens: maxTokens },
+        };
+        break;
+
+      default:
+        url = `${apiUrl}/chat/completions`;
+        break;
+    }
+
+    return { url, headers, body };
+  }
+
+  private parseProviderResponse(provider: string, data: any): string {
+    if (provider === 'google')
+      return (data?.candidates?.[0]?.content?.parts?.[0]?.text || '') as string;
+    if (provider === 'anthropic') return (data?.content?.[0]?.text || '') as string;
+    // OpenAI-compat (also Ollama /v1/chat/completions)
+    let msg: string = (data?.choices?.[0]?.message?.content || '') as string;
+    if (!msg) msg = (data?.message?.content || '') as string; // Ollama native /api/chat
+    if (!msg) msg = (data?.response || '') as string; // Ollama native /api/generate
+    return msg;
+  }
+
+  // Providers disagree on error shape: OpenAI/OpenRouter use {error:{message}},
+  // Cohere/Anthropic use {message}, Google uses {error:{message}} too. Read the raw
+  // body once, log it, and pick whichever field is present.
+  private async readApiError(response: ResponseLike, provider: string): Promise<string> {
+    const raw = await response.text().catch(() => '');
+    let parsed: { error?: { message?: string }; message?: string } = {};
+    try {
+      parsed = JSON.parse(raw) as { error?: { message?: string }; message?: string };
+    } catch {
+      // non-JSON error body — raw text is all we get
+    }
+
+    console.error(
+      `LLM API error ${response.status} from provider "${provider}": ${raw.slice(0, 1000)}`,
+    );
+
+    return (
+      parsed?.error?.message || parsed?.message || `LLM API returned status ${response.status}`
+    );
+  }
+
+  /**
+   * Send one request to a provider endpoint that has already been validated.
+   *
+   * The agent is pinned to the address that was checked, and redirects are
+   * refused rather than followed: a redirect names a destination none of the
+   * validation has seen, and following one would undo it. Any non-2xx status is
+   * returned rather than thrown, because the callers read the body to build a
+   * provider-specific message.
+   */
+  private async fetchWithTimeout(
+    url: string,
+    init: { method?: string; headers?: Record<string, string>; body?: string },
+    timeoutMs: number,
+    agent?: HttpAgent | HttpsAgent,
+  ): Promise<ResponseLike> {
+    const res = await axios.request<string>({
+      url,
+      method: (init.method as any) || 'GET',
+      headers: init.headers,
+      data: init.body,
+      timeout: timeoutMs,
+      httpAgent: agent,
+      httpsAgent: agent,
+      maxRedirects: 0,
+      responseType: 'text',
+      transformResponse: [(d: unknown) => d],
+      validateStatus: () => true,
+    });
+
+    const raw = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '');
+    return {
+      ok: res.status >= 200 && res.status < 300,
+      status: res.status,
+      text: () => Promise.resolve(raw),
+      json: () => Promise.resolve(JSON.parse(raw || '{}') as unknown),
+    };
+  }
+
+  // Reasoning models (e.g. Cohere command-a-*) spend most of their completion budget
+  // on hidden reasoning before emitting the answer — measured ~3.1k reasoning tokens for
+  // a single automation step. max_tokens is a ceiling, not a reservation, so a high
+  // default costs nothing for non-reasoning models.
+  private get maxTokensDefault(): number {
+    return parseInt(process.env.AI_MAX_TOKENS || '', 10) || 4000;
+  }
+
+  private async callLlm(
+    messages: ChatMessageDto[],
+    userId: string,
+    maxTokens = this.maxTokensDefault,
+  ): Promise<string> {
+    const [apiKey, model, rawApiUrl] = await Promise.all([
+      this.settingsService.get('ai_api_key', userId),
+      this.settingsService.get('ai_model', userId),
+      this.settingsService.get('ai_api_url', userId),
+    ]);
+
+    if (!model) {
+      throw new BadRequestException('AI model not configured. Please select a model in settings.');
+    }
+    if (!rawApiUrl) {
+      throw new BadRequestException(
+        'AI API URL not configured. Please set the API URL in settings.',
+      );
+    }
+
+    const destination = await this.resolveProviderEndpoint(rawApiUrl);
+    // The name decides which provider this is; the address is what gets sent to.
+    const apiUrl = destination.url.replace(/\/$/, '');
+    const requestBase = destination.requestUrl.replace(/\/$/, '');
+    const provider = this.detectProvider(apiUrl);
+
+    if (!apiKey && provider !== 'ollama') {
+      throw new BadRequestException('AI API key not configured. Please set it in settings.');
+    }
+
+    const { url, headers, body } = this.buildProviderRequest({
+      provider,
+      apiUrl: requestBase,
+      apiKey: apiKey || '',
+      model,
+      messages: normalizeMessages(messages),
+      maxTokens,
+      temperature: 0.1,
+      samplingExtras: true,
+    });
+
+    const timeoutMs = parseInt(process.env.AI_REQUEST_TIMEOUT_MS || '', 10) || 60_000;
+    const response = await this.fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { ...headers, Host: destination.hostHeader },
+        body: JSON.stringify(body),
+      },
+      timeoutMs,
+      destination.agent,
+    );
+
+    if (!response.ok) {
+      const apiError = await this.readApiError(response, provider);
+
+      if (response.status === 401) {
+        throw new BadRequestException('Invalid API key. Please check your settings.');
+      } else if (response.status === 429) {
+        throw new BadRequestException('Rate limit exceeded. Please try again in a moment.');
+      } else if (response.status === 402) {
+        throw new BadRequestException('Insufficient credits. Please check your account.');
+      }
+
+      throw new BadRequestException(apiError);
+    }
+
+    const responseData = await response.json();
+
+    // Truncated mid-reasoning: Cohere copies the partial chain-of-thought into `content`,
+    // so the "answer" is really cut-off reasoning. Fail loudly instead of returning it.
+    if (responseData?.choices?.[0]?.finish_reason === 'length') {
+      const used = responseData?.usage?.completion_tokens_details?.reasoning_tokens;
+      console.error(
+        `LLM response truncated at max_tokens=${maxTokens} (reasoning_tokens=${used ?? 'n/a'}, provider="${provider}", model="${model}")`,
+      );
+      throw new BadRequestException(
+        'AI response was cut off by the token limit. Raise AI_MAX_TOKENS or pick a model with less verbose reasoning.',
+      );
+    }
+
+    return this.parseProviderResponse(provider, responseData).trim();
   }
 
   private generateSystemPrompt(): string {
@@ -103,6 +422,7 @@ Your task is to respond with the NEXT NEW action to take. Available actions:
 - type(index, "text") - Type text into an input field
 - scroll("up" or "down") - Scroll the page
 - select(index, "option text") - Select an option from dropdown
+- press_enter(index) - Press Enter to submit an input (index optional, defaults to focused field)
 
 Format your response EXACTLY like this:
 ACTION: click(5)
@@ -265,19 +585,60 @@ ADMIN PANEL RULES (SUPER_ADMIN ONLY):
       }
 
       // Get API settings from database
-      const [apiKey, model, rawApiUrl] = await Promise.all([
+      const [apiKey, rawApiUrl] = await Promise.all([
         this.settingsService.get('ai_api_key', userId),
-        this.settingsService.get('ai_model', userId, 'deepseek/deepseek-chat-v3-0324:free'),
-        this.settingsService.get('ai_api_url', userId, 'https://openrouter.ai/api/v1'),
+        this.settingsService.get('ai_api_url', userId),
       ]);
 
-      const apiUrl = rawApiUrl ? this.validateApiUrl(rawApiUrl) : 'https://openrouter.ai/api/v1';
+      if (!rawApiUrl) {
+        throw new BadRequestException(
+          'AI API URL not configured. Please set the API URL in settings.',
+        );
+      }
 
+      const destination = await this.resolveProviderEndpoint(rawApiUrl);
+      // Only the provider identity is needed here; callLlm re-resolves and sends.
+      const apiUrl = destination.url.replace(/\/$/, '');
       const provider = this.detectProvider(apiUrl);
 
       // API key is optional for Ollama (localhost/private network)
       if (!apiKey && provider !== 'ollama') {
         throw new BadRequestException('AI API key not configured. Please set it in settings.');
+      }
+
+      // Find or create conversation if sessionId is provided
+      let conversation: Conversation | null = null;
+      let dbHistory: ChatMessageDto[] = [];
+
+      if (chatRequest.sessionId) {
+        conversation = await this.prisma.conversation.findUnique({
+          where: { sessionId: chatRequest.sessionId },
+        });
+
+        if (conversation && conversation.userId !== userId) {
+          throw new NotFoundException('Conversation not found');
+        }
+
+        if (!conversation) {
+          conversation = await this.prisma.conversation.create({
+            data: {
+              userId,
+              sessionId: chatRequest.sessionId,
+              title: 'New Chat',
+            },
+          });
+        } else {
+          // Fetch existing history from DB
+          const historyMsgs = await this.prisma.chatMessage.findMany({
+            where: { conversationId: conversation.id },
+            orderBy: { createdAt: 'asc' },
+            take: 40,
+          });
+          dbHistory = historyMsgs.map((m) => ({
+            role: m.role as 'system' | 'user' | 'assistant',
+            content: m.content,
+          }));
+        }
       }
 
       // Build messages array with system prompt and conversation history
@@ -290,15 +651,19 @@ ADMIN PANEL RULES (SUPER_ADMIN ONLY):
         content: systemPrompt,
       });
 
-      // Add conversation history if provided
-      if (chatRequest.history && Array.isArray(chatRequest.history)) {
-        chatRequest.history.forEach((msg: ChatMessageDto) => {
-          messages.push({
-            role: msg.role,
-            content: msg.content,
-          });
+      // Prefer the request history: during a browser-automation run it carries the
+      // "Action completed/failed" entries that tell the model what already happened.
+      // Those are never persisted, so preferring dbHistory here left the agent blind and
+      // it repeated actions until it hit maxIterations. dbHistory is the reload fallback.
+      const requestHistory = Array.isArray(chatRequest.history) ? chatRequest.history : [];
+      const history = requestHistory.length > 0 ? requestHistory : dbHistory;
+
+      history.forEach((msg: ChatMessageDto) => {
+        messages.push({
+          role: msg.role,
+          content: msg.content,
         });
-      }
+      });
 
       let userMessage = chatRequest.message;
 
@@ -316,173 +681,84 @@ ADMIN PANEL RULES (SUPER_ADMIN ONLY):
         }
       }
 
+      // Save user message to database if we have a conversation
+      if (conversation) {
+        const taskMatch = chatRequest.message.match(/Task:\s*([^\n]+)/);
+        const cleanUserMsg = taskMatch ? taskMatch[1].trim() : chatRequest.message;
+
+        await this.prisma.chatMessage.create({
+          data: {
+            conversationId: conversation.id,
+            role: 'user',
+            content: cleanUserMsg,
+          },
+        });
+
+        // Auto-generate title by AI if it is still 'New Chat'
+        if (conversation.title === 'New Chat') {
+          try {
+            const titlePrompt = `Analyze the following first user message in a chat and generate a very short, concise topic title summarizing it (maximum 4 words, no quotes, no markdown, no ending period):
+
+"${cleanUserMsg}"`;
+
+            const aiGeneratedTitle = await this.callLlm(
+              [{ role: 'user', content: titlePrompt }],
+              userId,
+            );
+
+            // Clean up the generated title
+            let cleanTitle = aiGeneratedTitle
+              .replace(/['"“”`.]/g, '')
+              .replace(/^title:\s*/i, '') // strip "Title: " prefix if generated
+              .trim();
+            if (cleanTitle.length > 40) {
+              cleanTitle = cleanTitle.substring(0, 40) + '...';
+            }
+
+            if (!cleanTitle || cleanTitle.length < 2) {
+              throw new Error('Generated title is empty or too short');
+            }
+
+            conversation = await this.prisma.conversation.update({
+              where: { id: conversation.id },
+              data: { title: cleanTitle },
+            });
+          } catch (e) {
+            console.warn('Failed to generate AI title, using fallback', e);
+            const cleanTitle = cleanUserMsg.trim();
+            const newTitle =
+              cleanTitle.length > 30 ? cleanTitle.substring(0, 30) + '...' : cleanTitle;
+            conversation = await this.prisma.conversation.update({
+              where: { id: conversation.id },
+              data: { title: newTitle || 'New Chat' },
+            });
+          }
+        }
+      }
+
       messages.push({
         role: 'user',
         content: userMessage,
       });
 
-      const isGpt5Model = typeof model === 'string' && model.startsWith('gpt-5');
-      const modelFamily = this.getModelFamily(model);
+      // Call API helper to get response
+      const aiMessage = await this.callLlm(messages, userId);
 
-      // Prepare request based on provider
-      let requestUrl = apiUrl;
-      const requestHeaders: any = {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      };
-      let requestBody: any = {
-        model,
-        messages,
-        temperature: 0.1,
-        max_tokens: 500,
-        stream: false,
-      };
+      // Save assistant message to database if we have a conversation
+      if (conversation && aiMessage) {
+        await this.prisma.chatMessage.create({
+          data: {
+            conversationId: conversation.id,
+            role: 'assistant',
+            content: aiMessage,
+          },
+        });
 
-      // Adjust for different providers
-      switch (provider) {
-        case 'openrouter':
-          requestUrl = `${apiUrl}/chat/completions`;
-          requestHeaders['HTTP-Referer'] = process.env.APP_URL || 'http://localhost:3000';
-          requestHeaders['X-Title'] = 'Taskosaur AI Assistant';
-          requestBody.top_p = 0.9;
-          requestBody.frequency_penalty = 0;
-          requestBody.presence_penalty = 0;
-          break;
-
-        case 'openai':
-          requestUrl = `${apiUrl}/chat/completions`;
-          delete requestBody.max_tokens;
-          requestBody.max_completion_tokens = 500;
-          if (isGpt5Model) {
-            delete requestBody.temperature;
-          } else {
-            requestBody.top_p = 0.9;
-            requestBody.frequency_penalty = 0;
-            requestBody.presence_penalty = 0;
-          }
-          break;
-
-        case 'ollama':
-          // Ollama uses OpenAI-compatible API at /v1/chat/completions or /api/chat
-          // Check if URL already contains the endpoint path
-          if (apiUrl.includes('/v1')) {
-            requestUrl = apiUrl.endsWith('/chat/completions')
-              ? apiUrl
-              : `${apiUrl}/chat/completions`;
-          } else if (apiUrl.includes('/api')) {
-            requestUrl = apiUrl.endsWith('/chat') ? apiUrl : `${apiUrl}/chat`;
-          } else {
-            // Default to OpenAI-compatible endpoint
-            requestUrl = `${apiUrl}/v1/chat/completions`;
-          }
-          // Ollama doesn't require auth for local instances
-          delete requestHeaders['Authorization'];
-          requestBody.top_p = 0.9;
-          break;
-
-        case 'anthropic': {
-          requestUrl = `${apiUrl}/messages`;
-          requestHeaders['x-api-key'] = apiKey;
-          requestHeaders['anthropic-version'] = '2023-06-01';
-          delete requestHeaders['Authorization'];
-          const systemContent = messages.find((m) => m.role === 'system')?.content ?? '';
-          requestBody = {
-            model,
-            messages: messages.filter((m) => m.role !== 'system'), // Anthropic doesn't use system role the same way
-            // Array form with `cache_control` enables prompt caching on the
-            // (large, stable) system prompt. Paid on first write, ~0.1x on reads.
-            system: [
-              {
-                type: 'text',
-                text: systemContent,
-                cache_control: { type: 'ephemeral' },
-              },
-            ],
-            max_tokens: 500,
-            temperature: 0.1,
-          };
-          break;
-        }
-
-        case 'google':
-          // Google Gemini has a different API structure
-          this.validateModelName(model);
-          requestUrl = `${apiUrl}/models/${encodeURIComponent(String(model))}:generateContent?key=${encodeURIComponent(apiKey || '')}`;
-          delete requestHeaders['Authorization'];
-          requestBody = {
-            contents: messages.map((m) => ({
-              role: m.role === 'assistant' ? 'model' : m.role == 'system' ? 'model' : m.role,
-              parts: [{ text: m.content }],
-            })),
-            generationConfig: {
-              temperature: 0.1,
-              maxOutputTokens: 500,
-            },
-          };
-          break;
-
-        default: // custom or openrouter fallback
-          requestUrl = `${apiUrl}/chat/completions`;
-          break;
-      }
-
-      // Enable Anthropic prompt caching when a Claude model is served over an
-      // OpenAI-compatible wire (OpenRouter, custom proxies like CLIProxyAPI,
-      // self-hosted Ollama fronting Claude). The Anthropic-native branch above
-      // already attaches `cache_control` directly on the system block.
-      if (
-        modelFamily === 'anthropic' &&
-        (provider === 'openrouter' || provider === 'ollama' || provider === 'custom')
-      ) {
-        requestBody.messages = this.withAnthropicCacheBreakpoint(messages);
-      }
-
-      // Call API
-      const response = await fetch(requestUrl, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(requestBody),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-
-        if (response.status === 401) {
-          throw new BadRequestException(
-            'Invalid API key. Please check your OpenRouter API key in settings.',
-          );
-        } else if (response.status === 429) {
-          throw new BadRequestException(
-            'Rate limit exceeded by API provider. Please try again in a moment.',
-          );
-        } else if (response.status === 402) {
-          throw new BadRequestException(
-            'Insufficient credits. Please check your OpenRouter account.',
-          );
-        }
-
-        throw new BadRequestException(
-          errorData.error?.message || `API request failed with status ${response.status}`,
-        );
-      }
-
-      const data = await response.json();
-
-      let aiMessage = '';
-
-      // Parse response based on provider
-      switch (provider) {
-        case 'anthropic':
-          aiMessage = data.content?.[0]?.text || '';
-          break;
-
-        case 'google':
-          aiMessage = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          break;
-
-        default: // OpenAI, OpenRouter, and custom providers use the same format
-          aiMessage = data.choices?.[0]?.message?.content || '';
-          break;
+        // Touch the conversation updatedAt timestamp
+        await this.prisma.conversation.update({
+          where: { id: conversation.id },
+          data: { updatedAt: new Date() },
+        });
       }
 
       return {
@@ -492,12 +768,38 @@ ADMIN PANEL RULES (SUPER_ADMIN ONLY):
     } catch (error: any) {
       console.error(error);
       const errorMessage = error instanceof Error ? error.message : String(error);
-      if (errorMessage?.includes('Failed to fetch') || errorMessage?.includes('NetworkError')) {
+
+      // Node's fetch reports every connection-level failure as the bare string
+      // "fetch failed" and hides the real reason in error.cause.code. The old check only
+      // matched the browser's wording ("Failed to fetch"), so these fell through
+      // undiagnosed.
+      const causeCode = error instanceof Error ? (error as any).cause?.code : undefined;
+      const isAbort = error instanceof Error && (error as any).name === 'AbortError';
+
+      if (isAbort) {
         return {
-          message: 'Network error. Please check your internet connection.',
+          message: 'The AI request timed out. Try again, or raise AI_REQUEST_TIMEOUT_MS.',
           success: false,
-          error: 'Network error. Please check your internet connection.',
+          error: 'The AI request timed out. Try again, or raise AI_REQUEST_TIMEOUT_MS.',
         };
+      }
+
+      if (
+        causeCode ||
+        errorMessage?.includes('fetch failed') ||
+        errorMessage?.includes('Failed to fetch') ||
+        errorMessage?.includes('NetworkError')
+      ) {
+        const detail =
+          {
+            ENOTFOUND: 'Host not found — check the AI API URL.',
+            ECONNREFUSED: 'Connection refused — the AI service is not reachable.',
+            ECONNRESET: 'Connection reset by the AI provider (possibly rate limiting).',
+            ETIMEDOUT: 'Connection timed out — the AI service is not responding.',
+          }[causeCode as string] || 'Check your internet connection and the AI API URL.';
+
+        const msg = `Could not reach the AI provider. ${detail}`;
+        return { message: msg, success: false, error: msg };
       }
 
       return {
@@ -532,7 +834,10 @@ ADMIN PANEL RULES (SUPER_ADMIN ONLY):
         throw new Error('AI not configured');
       }
 
-      const apiUrl = this.validateApiUrl(rawApiUrl);
+      const destination = await this.resolveProviderEndpoint(rawApiUrl);
+      // The name decides which provider this is; the address is what gets sent to.
+      const apiUrl = destination.url.replace(/\/$/, '');
+      const requestBase = destination.requestUrl.replace(/\/$/, '');
       const provider = this.detectProvider(apiUrl);
       if (!apiKey && provider !== 'ollama') {
         return {
@@ -568,85 +873,26 @@ Respond ONLY with the description text, nothing else.`;
         { role: 'user', content: userMessage },
       ];
 
-      const isGpt5Model = typeof model === 'string' && model.startsWith('gpt-5');
-
-      let requestUrl = apiUrl;
-      const requestHeaders: any = {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      };
-      let requestBody: any = {
+      const { url, headers, body } = this.buildProviderRequest({
+        provider,
+        apiUrl: requestBase,
+        apiKey: apiKey || '',
         model,
         messages,
+        maxTokens: 300,
         temperature: 0.7,
-        max_tokens: 300,
-        stream: false,
-      };
-
-      switch (provider) {
-        case 'openrouter':
-          requestUrl = `${apiUrl}/chat/completions`;
-          requestHeaders['HTTP-Referer'] = process.env.APP_URL || 'http://localhost:3000';
-          requestHeaders['X-Title'] = 'Taskosaur AI Assistant';
-          break;
-        case 'openai':
-          requestUrl = `${apiUrl}/chat/completions`;
-          delete requestBody.max_tokens;
-          requestBody.max_completion_tokens = 300;
-          if (isGpt5Model) {
-            delete requestBody.temperature;
-          }
-          break;
-        case 'ollama':
-          if (apiUrl.includes('/v1')) {
-            requestUrl = apiUrl.endsWith('/chat/completions')
-              ? apiUrl
-              : `${apiUrl}/chat/completions`;
-          } else if (apiUrl.includes('/api')) {
-            requestUrl = apiUrl.endsWith('/chat') ? apiUrl : `${apiUrl}/chat`;
-          } else {
-            requestUrl = `${apiUrl}/v1/chat/completions`;
-          }
-          delete requestHeaders['Authorization'];
-          break;
-        case 'anthropic':
-          requestUrl = `${apiUrl}/messages`;
-          requestHeaders['x-api-key'] = apiKey;
-          requestHeaders['anthropic-version'] = '2023-06-01';
-          delete requestHeaders['Authorization'];
-          requestBody = {
-            model,
-            messages: messages.filter((m) => m.role !== 'system'),
-            system: messages.find((m) => m.role === 'system')?.content,
-            max_tokens: 300,
-            temperature: 0.7,
-          };
-          break;
-        case 'google':
-          this.validateModelName(model);
-          requestUrl = `${apiUrl}/models/${encodeURIComponent(String(model))}:generateContent?key=${encodeURIComponent(apiKey || '')}`;
-          delete requestHeaders['Authorization'];
-          requestBody = {
-            contents: messages.map((m) => ({
-              role: m.role === 'assistant' ? 'model' : m.role === 'system' ? 'model' : m.role,
-              parts: [{ text: m.content }],
-            })),
-            generationConfig: {
-              temperature: 0.7,
-              maxOutputTokens: 300,
-            },
-          };
-          break;
-        default:
-          requestUrl = `${apiUrl}/chat/completions`;
-          break;
-      }
-
-      const response = await fetch(requestUrl, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(requestBody),
       });
+
+      const response = await this.fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: { ...headers, Host: destination.hostHeader },
+          body: JSON.stringify(body),
+        },
+        60_000,
+        destination.agent,
+      );
 
       if (!response.ok) {
         return {
@@ -657,22 +903,8 @@ Respond ONLY with the description text, nothing else.`;
       }
 
       const data = await response.json();
-      let aiMessage = '';
-
-      switch (provider) {
-        case 'anthropic':
-          aiMessage = data.content?.[0]?.text || '';
-          break;
-        case 'google':
-          aiMessage = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          break;
-        default:
-          aiMessage = data.choices?.[0]?.message?.content || '';
-          break;
-      }
-
       return {
-        description: aiMessage.trim(),
+        description: this.parseProviderResponse(provider, data).trim(),
         success: true,
       };
     } catch (error: any) {
@@ -685,10 +917,18 @@ Respond ONLY with the description text, nothing else.`;
     }
   }
 
-  // Clear context for a specific session (no-op since context tracking was removed)
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  clearContext(sessionId: string): { success: boolean } {
-    return { success: true };
+  // Clear context/messages for a specific session
+  async clearContext(userId: string, sessionId: string): Promise<{ success: boolean }> {
+    const conversation = await this.prisma.conversation.findUnique({
+      where: { sessionId },
+    });
+    if (conversation && conversation.userId === userId) {
+      await this.prisma.chatMessage.deleteMany({
+        where: { conversationId: conversation.id },
+      });
+      return { success: true };
+    }
+    return { success: false };
   }
 
   private readonly allowedHosts: string[] = [
@@ -705,6 +945,9 @@ Respond ONLY with the description text, nothing else.`;
     // Google - base domains
     'generativelanguage.googleapis.com',
     'aiplatform.googleapis.com',
+
+    // Cohere
+    'api.cohere.com',
   ];
 
   // AWS Bedrock pattern
@@ -738,6 +981,45 @@ Respond ONLY with the description text, nothing else.`;
     return privateIPv4Pattern.test(hostname);
   }
 
+  /**
+   * Validate a provider endpoint and pin the connection to the address that was
+   * checked.
+   *
+   * This URL comes from settings that any authenticated user can write, so
+   * without these checks a user could aim the server at anything it can reach
+   * and read the answer back through the error path. The destination must
+   * therefore resolve to a public address, unless an operator has deliberately
+   * opened that up.
+   *
+   * AI_ALLOW_PRIVATE_ENDPOINTS exists for the self-hosted case: a model server
+   * on localhost or the local network is a legitimate deployment. It is off by
+   * default because it is only safe when the operator, not the user, decides
+   * where requests may go, and AI_ALLOWED_HOSTS narrows it further.
+   */
+  private async resolveProviderEndpoint(apiUrl: string): Promise<SafeDestination> {
+    const allowPrivate = process.env.AI_ALLOW_PRIVATE_ENDPOINTS === 'true';
+    const allowlist = parseHostAllowlist(process.env.AI_ALLOWED_HOSTS, ['*']);
+
+    try {
+      return await resolveSafeDestination(
+        apiUrl,
+        { allowlist, allowPrivate, originOnly: false },
+        (reason) => this.logger.warn(`AI endpoint refused: ${reason}`),
+      );
+    } catch (err) {
+      if (err instanceof UnsafeDestinationError) {
+        throw new BadRequestException(
+          allowPrivate
+            ? err.message
+            : `${err.message}. Endpoints on the server's own network are not permitted ` +
+                'unless an administrator has enabled them.',
+        );
+      }
+      throw err;
+    }
+  }
+
+  /** Shape-only validation, kept for callers that just need a tidy URL. */
   validateApiUrl(apiUrl: string): string {
     let url: URL;
     try {
@@ -745,16 +1027,9 @@ Respond ONLY with the description text, nothing else.`;
     } catch {
       throw new BadRequestException('Invalid URL format');
     }
-
-    // Allow HTTP for localhost and private networks (e.g., self-hosted Ollama)
-    const allowHttp = this.isLocalhost(url.hostname) || this.isPrivateNetwork(url.hostname);
-
-    if (url.protocol !== 'https:' && !allowHttp) {
-      throw new BadRequestException(
-        'Only HTTPS URLs allowed (HTTP is permitted for localhost and private network addresses)',
-      );
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      throw new BadRequestException('Only HTTP(S) URLs are supported');
     }
-
     return url.toString().replace(/\/$/, '');
   }
 
@@ -767,7 +1042,10 @@ Respond ONLY with the description text, nothing else.`;
 
     try {
       // Validate the URL (this also allows HTTP for localhost/private networks)
-      const validatedUrl = this.validateApiUrl(apiUrl);
+      const destination = await this.resolveProviderEndpoint(apiUrl);
+      // The name decides which provider this is; the address is what gets sent to.
+      const validatedUrl = destination.url.replace(/\/$/, '');
+      const requestBase = destination.requestUrl.replace(/\/$/, '');
       const provider = this.detectProvider(validatedUrl);
 
       // API key is required for non-Ollama providers
@@ -786,97 +1064,29 @@ Respond ONLY with the description text, nothing else.`;
         },
       ];
 
-      const isGpt5Model = typeof model === 'string' && model.startsWith('gpt-5');
-
-      // Prepare request based on provider
-      let requestUrl = validatedUrl;
-      const requestHeaders: any = {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      };
-      let requestBody: any = {
+      const { url, headers, body } = this.buildProviderRequest({
+        provider,
+        apiUrl: requestBase,
+        apiKey,
         model,
         messages,
+        maxTokens: 50,
         temperature: 0.1,
-        max_tokens: 50,
-        stream: false,
-      };
-
-      // Adjust for different providers
-      switch (provider) {
-        case 'openrouter':
-          requestUrl = `${validatedUrl}/chat/completions`;
-          requestHeaders['HTTP-Referer'] = process.env.APP_URL || 'http://localhost:3000';
-          requestHeaders['X-Title'] = 'Taskosaur AI Assistant';
-          break;
-
-        case 'openai':
-          requestUrl = `${validatedUrl}/chat/completions`;
-          delete requestBody.max_tokens;
-          requestBody.max_completion_tokens = 50;
-          if (isGpt5Model) {
-            delete requestBody.temperature;
-          }
-          break;
-
-        case 'ollama':
-          // Ollama uses OpenAI-compatible API at /v1/chat/completions or /api/chat
-          if (validatedUrl.includes('/v1')) {
-            requestUrl = validatedUrl.endsWith('/chat/completions')
-              ? validatedUrl
-              : `${validatedUrl}/chat/completions`;
-          } else if (validatedUrl.includes('/api')) {
-            requestUrl = validatedUrl.endsWith('/chat') ? validatedUrl : `${validatedUrl}/chat`;
-          } else {
-            requestUrl = `${validatedUrl}/v1/chat/completions`;
-          }
-          // Ollama doesn't require auth for local instances
-          delete requestHeaders['Authorization'];
-          break;
-
-        case 'anthropic':
-          requestUrl = `${validatedUrl}/messages`;
-          requestHeaders['x-api-key'] = apiKey;
-          requestHeaders['anthropic-version'] = '2023-06-01';
-          delete requestHeaders['Authorization'];
-          requestBody = {
-            model,
-            messages,
-            max_tokens: 50,
-            temperature: 0.1,
-          };
-          break;
-
-        case 'google':
-          this.validateModelName(model);
-          requestUrl = `${validatedUrl}/models/${encodeURIComponent(String(model))}:generateContent?key=${encodeURIComponent(apiKey)}`;
-          delete requestHeaders['Authorization'];
-          requestBody = {
-            contents: messages.map((m) => ({
-              role: m.role === 'assistant' ? 'model' : m.role == 'system' ? 'model' : m.role,
-              parts: [{ text: m.content }],
-            })),
-            generationConfig: {
-              temperature: 0.1,
-              maxOutputTokens: 50,
-            },
-          };
-          break;
-
-        default:
-          requestUrl = `${validatedUrl}/chat/completions`;
-          break;
-      }
-
-      // Make the test request
-      const response = await fetch(requestUrl, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(requestBody),
       });
 
+      const response = await this.fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: { ...headers, Host: destination.hostHeader },
+          body: JSON.stringify(body),
+        },
+        120_000,
+        destination.agent,
+      );
+
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
+        const apiError = await this.readApiError(response, provider);
 
         if (response.status === 401) {
           return {
@@ -902,25 +1112,12 @@ Respond ONLY with the description text, nothing else.`;
 
         return {
           success: false,
-          error: errorData.error?.message || `API request failed with status ${response.status}`,
+          error: apiError,
         };
       }
 
-      // Parse response to verify we got a valid AI response
       const data = await response.json();
-      let aiMessage = '';
-
-      switch (provider) {
-        case 'anthropic':
-          aiMessage = data.content?.[0]?.text || '';
-          break;
-        case 'google':
-          aiMessage = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          break;
-        default:
-          aiMessage = data.choices?.[0]?.message?.content || '';
-          break;
-      }
+      const aiMessage = this.parseProviderResponse(provider, data);
 
       if (aiMessage) {
         return {
@@ -938,6 +1135,19 @@ Respond ONLY with the description text, nothing else.`;
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       const causeCode = error instanceof Error && (error as any).cause?.code;
+
+      // AbortError is thrown when our AbortController timeout fires (large model loading)
+      const isAbortError =
+        (error instanceof Error && (error as any).name === 'AbortError') ||
+        errorMessage.includes('AbortError') ||
+        errorMessage.includes('This operation was aborted');
+      if (isAbortError) {
+        return {
+          success: false,
+          error:
+            'Request timed out (2 minutes). The model may still be loading into memory — please wait a moment and try again.',
+        };
+      }
 
       if (causeCode === 'ECONNREFUSED' || errorMessage.includes('ECONNREFUSED')) {
         return {
@@ -1024,5 +1234,81 @@ Respond ONLY with the description text, nothing else.`;
     if (!allowedPattern.test(trimmedModel)) {
       throw new BadRequestException(customErrorMessage);
     }
+  }
+
+  async getConversations(userId: string) {
+    return this.prisma.conversation.findMany({
+      where: { userId },
+      orderBy: { updatedAt: 'desc' },
+      take: 100, // Limit list to most recent 100 conversations to prevent huge payloads
+      include: {
+        messages: {
+          orderBy: { createdAt: 'asc' },
+          take: 40, // Limit messages loaded per conversation to recent history
+        },
+      },
+    });
+  }
+
+  async createConversation(userId: string, dto: CreateConversationDto) {
+    const sessionId = dto.sessionId || `session_${Date.now()}_${randomBytes(16).toString('hex')}`;
+    return this.prisma.conversation.create({
+      data: {
+        userId,
+        title: dto.title || 'New Chat',
+        sessionId,
+      },
+      include: {
+        messages: true,
+      },
+    });
+  }
+
+  async renameConversation(userId: string, id: string, dto: RenameConversationDto) {
+    return this.prisma.conversation.update({
+      where: { id, userId },
+      data: {
+        title: dto.title,
+      },
+      include: {
+        messages: true,
+      },
+    });
+  }
+
+  async deleteConversation(userId: string, id: string) {
+    await this.prisma.conversation.delete({
+      where: { id, userId },
+    });
+    return { success: true };
+  }
+
+  async updateMessages(userId: string, id: string, dto: UpdateMessagesDto) {
+    const conversation = await this.prisma.conversation.findFirst({
+      where: { id, userId },
+    });
+    if (!conversation) {
+      throw new BadRequestException('Conversation not found');
+    }
+
+    // Use transaction to delete and recreate messages safely
+    await this.prisma.$transaction([
+      this.prisma.chatMessage.deleteMany({
+        where: { conversationId: id },
+      }),
+      this.prisma.chatMessage.createMany({
+        data: dto.messages.map((msg) => ({
+          conversationId: id,
+          role: msg.role,
+          content: msg.content,
+        })),
+      }),
+      this.prisma.conversation.update({
+        where: { id },
+        data: { updatedAt: new Date() },
+      }),
+    ]);
+
+    return { success: true };
   }
 }

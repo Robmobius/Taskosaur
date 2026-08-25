@@ -23,7 +23,11 @@ export class UsersService {
   ) {}
 
   async create(createUserDto: CreateUserDto): Promise<Omit<User, 'password'>> {
-    const existingUser = await this.prisma.user.findUnique({
+    if (!createUserDto.email) {
+      throw new BadRequestException('Email is required');
+    }
+
+    const existingUser = await this.prisma.user.findFirst({
       where: { email: createUserDto.email },
     });
 
@@ -40,6 +44,10 @@ export class UsersService {
     ) {
       finalUsername = `${baseUsername}${counter}`;
       counter++;
+    }
+
+    if (!createUserDto.password) {
+      throw new BadRequestException('Password is required');
     }
 
     const hashedPassword = await bcrypt.hash(createUserDto.password, BCRYPT_SALT_ROUNDS);
@@ -141,8 +149,13 @@ export class UsersService {
   }
 
   async getPublicProfile(identifier: string, requesterId: string) {
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      identifier,
+    );
     const user = await this.prisma.user.findFirst({
-      where: { username: identifier },
+      where: isUuid
+        ? { OR: [{ id: identifier }, { username: identifier }] }
+        : { username: identifier },
       select: {
         id: true,
         firstName: true,

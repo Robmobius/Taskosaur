@@ -27,6 +27,7 @@ export class BrowserAgent {
   private steps: AgentStep[] = [];
   private conversationHistory: Array<{ role: string; content: string }> = [];
   private aborted: boolean = false;
+  private sessionId?: string;
 
   constructor(config?: BrowserAgentConfig) {
     this.detector = new DOMDetector();
@@ -40,10 +41,14 @@ export class BrowserAgent {
   public async executeTask(
     task: string,
     onProgress?: (step: AgentStep) => void,
-    onStatusChange?: (status: string) => void
+    onStatusChange?: (status: string) => void,
+    sessionId?: string
   ): Promise<AgentResult> {
+    this.sessionId = sessionId;
     this.steps = [];
     this.aborted = false;
+    let consecutiveFailures = 0;
+    const maxConsecutiveFailures = 3;
 
     for (let i = 0; i < this.config.maxIterations; i++) {
       if (this.aborted) {
@@ -66,6 +71,17 @@ export class BrowserAgent {
         );
 
         const parsedAction = this.parseAction(llmResponse);
+
+        // No action AND no explicit DONE: means the model returned something we can't
+        // act on (e.g. truncated reasoning). Reporting success here silently ends the
+        // task as "complete" — surface it as a failure instead.
+        if (!parsedAction && !this.isExplicitDone(llmResponse)) {
+          return {
+            success: false,
+            message: `AI returned no usable action. Raw response: ${llmResponse.slice(0, 200)}`,
+            steps: this.steps,
+          };
+        }
 
         if (!parsedAction) {
           const step: AgentStep = {
@@ -104,22 +120,27 @@ export class BrowserAgent {
         if (onProgress) onProgress(step);
 
         if (!actionResult.success) {
-          // Action failed - add this to conversation history so LLM knows
           this.conversationHistory.push({
             role: "user",
-            content: `Action failed: ${parsedAction.type}(${parsedAction.params.join(", ")}) - ${actionResult.message}`,
+            content: `❌ Action failed: ${parsedAction.type}(${parsedAction.params.join(", ")}) - ${actionResult.message}`,
           });
-          return {
-            success: false,
-            message: `Action failed: ${actionResult.message}`,
-            steps: this.steps,
-          };
+          consecutiveFailures++;
+          if (consecutiveFailures >= maxConsecutiveFailures) {
+            return {
+              success: false,
+              message: `Failed after ${consecutiveFailures} attempts: ${actionResult.message}`,
+              steps: this.steps,
+            };
+          }
+          await this.wait(this.config.waitAfterAction);
+          continue;
         }
 
         // Add action result to conversation history so LLM knows what was done
+        consecutiveFailures = 0;
         this.conversationHistory.push({
           role: "user",
-          content: `Action completed: ${parsedAction.type}(${parsedAction.params.join(", ")}) - ${actionResult.message}`,
+          content: `✅ Action completed: ${parsedAction.type}(${parsedAction.params.join(", ")}) - ${actionResult.message}`,
         });
 
         // Wait for page to settle after action
@@ -150,14 +171,10 @@ export class BrowserAgent {
   ): Promise<string> {
     try {
       // Build user message
-      let userMessage: string;
       const currentUrl = window.location.href;
 
-      if (isFirstIteration) {
-        userMessage = `Task: ${task}\n\nCurrent URL: ${currentUrl}\n\nAvailable elements:\n${elementsHtml}`;
-      } else {
-        userMessage = `Current URL: ${currentUrl}\n\nAvailable elements:\n${elementsHtml}`;
-      }
+      // Always include the Task so the backend matches the regex to inject context/rules
+      const userMessage = `Task: ${task}\n\nCurrent URL: ${currentUrl}\n\nAvailable elements:\n${elementsHtml}`;
 
       this.conversationHistory.push({
         role: "user",
@@ -171,6 +188,7 @@ export class BrowserAgent {
       const response = await api.post("/ai-chat/chat", {
         message: userMessage,
         history: cleanHistory,
+        sessionId: this.sessionId,
       });
 
       const data = response.data;
@@ -190,17 +208,26 @@ export class BrowserAgent {
       return llmResponse;
     } catch (error: any) {
       const msg = error?.response?.data?.message || error?.response?.data?.error || error?.message || "Unknown error";
-      return `DONE: ${msg}`;
+      throw new Error(msg);
     }
   }
 
   //Parse LLM response to extract action
 
+  private isExplicitDone(response: string): boolean {
+    const trimmed = response.trim();
+    return (
+      trimmed.startsWith("DONE:") ||
+      trimmed.startsWith("ASK:") ||
+      trimmed.toLowerCase().includes("task complete")
+    );
+  }
+
   private parseAction(response: string): { type: string; params: any[] } | null {
     const trimmed = response.trim();
 
     // Check for DONE
-    if (trimmed.startsWith("DONE:") || trimmed.toLowerCase().includes("task complete")) {
+    if (this.isExplicitDone(trimmed)) {
       return null;
     }
 
@@ -294,6 +321,12 @@ export class BrowserAgent {
           return { success: false, message: "select requires index and option parameters" };
         }
         return await this.executor.selectOption(params[0], params[1], { detector });
+
+      // The prompt's quick-create flows tell the model to press Enter to submit.
+      case "press_enter":
+      case "pressenter":
+      case "enter":
+        return await this.executor.pressEnter(params[0], { detector });
 
       default:
         return { success: false, message: `Unknown action type: ${type}` };

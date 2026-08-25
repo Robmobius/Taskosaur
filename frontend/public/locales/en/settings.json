@@ -12,8 +12,10 @@
     "no_description": "No description provided",
     "workspaces": "Workspaces",
     "members": "Members",
-    "workspaces_count": "{{count}} Workspaces",
-    "members_count": "{{count}} Members",
+    "workspaces_count_one": "{{count}} Workspace",
+    "workspaces_count_other": "{{count}} Workspaces",
+    "members_count_one": "{{count}} Member",
+    "members_count_other": "{{count}} Members",
     "about_title": "About Organizations",
     "about_description": "Organizations are your top-level containers for workspaces, projects, and teams. Click the checkbox icon to set an organization as your default. Click on any organization card to manage its settings (requires owner or administrator permissions)."
   },
@@ -51,7 +53,9 @@
     "title": "Language & Region",
     "description": "Select your preferred language for the application interface.",
     "display_language": "Display Language",
-    "select_placeholder": "Select a language"
+    "select_placeholder": "Select a language",
+    "update_success": "Language updated successfully",
+    "update_failed": "Failed to update language"
   },
   "ai_section": {
     "title": "AI Assistant Settings",
@@ -165,6 +169,11 @@
   "workspace_settings": {
     "title": "Workspace Settings",
     "description": "Manage your workspace configuration and preferences",
+    "tabs": {
+      "general": "General",
+      "trello": "Trello Sync",
+      "jira": "Jira Sync"
+    },
     "general_info": "General Information",
     "name": "Workspace Name",
     "name_placeholder": "Enter workspace name",

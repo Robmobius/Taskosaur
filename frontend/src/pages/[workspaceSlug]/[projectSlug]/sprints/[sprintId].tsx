@@ -343,6 +343,7 @@ const sprintId = resolvedSprintId;
         }),
         sortBy: sortField,
         sortOrder: sortOrder,
+        parentTaskId: "all",
         page: currentPage,
         limit: pageSize,
       };
@@ -466,8 +467,9 @@ const sprintId = resolvedSprintId;
         const data = (await getCalendarTask(currentOrganizationId, {
           ...params,
           includeSubtasks: true,
-          sortBy: "displayOrder",
+          sortBy: "listRank",
           sortOrder: "asc",
+          viewType: "GANTT",
         })) as any;
         setGanttTasks(data.data || []);
       } else {
@@ -881,6 +883,7 @@ const sprintId = resolvedSprintId;
           onTaskSelect={handleTaskSelect}
           onTasksSelect={handleTasksSelect}
           totalTask={pagination.totalCount}
+          sprintId={sprintId as string}
         />
       );
     }
@@ -931,12 +934,13 @@ const sprintId = resolvedSprintId;
             projectMembers={projectMembers}
             addTaskStatuses={availableTaskStatuses}
             onTaskRefetch={handleTaskRefetch}
-            showAddTaskRow={false}
+            showAddTaskRow={isAuth && userRole !== "VIEWER"}
             showBulkActionBar={hasAccess || userRole == "OWNER" || userRole === "MANAGER"}
             selectedTasks={selectedTasks}
             onTaskSelect={handleTaskSelect}
             onTasksSelect={handleTasksSelect}
             totalTask={pagination.totalCount}
+            sprintId={sprintId as string}
           />
         );
     }
